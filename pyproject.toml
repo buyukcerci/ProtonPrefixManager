@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
     "PySide6>=6.8",
+    "vdf>=3.4",
 ]
 
 [project.optional-dependencies]
@@ -43,3 +44,7 @@ python_version = "3.11"
 check_untyped_defs = true
 warn_unused_ignores = true
 warn_redundant_casts = true
+
+[[tool.mypy.overrides]]
+module = "vdf"
+ignore_missing_imports = true
