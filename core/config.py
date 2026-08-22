@@ -36,7 +36,7 @@ class AppConfig:
     steam_roots: list[str] = field(default_factory=list)
     custom_roots: list[str] = field(default_factory=list)
     font_family: str | None = None
-    font_size: int = 11
+    font_size: int = 10
     type_filter: list[PrefixType] = field(default_factory=lambda: list(DEFAULT_TYPE_FILTER))
     sort_column: str = "size"
     sort_ascending: bool = False

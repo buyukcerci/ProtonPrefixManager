@@ -20,7 +20,7 @@ def test_default_config_values() -> None:
     assert config.steam_roots == []
     assert config.custom_roots == []
     assert config.font_family is None
-    assert config.font_size == 11
+    assert config.font_size == 10
     assert config.type_filter == [PrefixType.STEAM, PrefixType.NON_STEAM]
     assert config.sort_column == "size"
     assert config.sort_ascending is False
@@ -90,7 +90,7 @@ def test_wrong_types_fall_back_to_defaults(tmp_path: Path) -> None:
     assert config.steam_roots == []
     assert config.custom_roots == []
     assert config.font_family is None
-    assert config.font_size == 11
+    assert config.font_size == 10
     assert config.type_filter == [PrefixType.STEAM]
     assert config.sort_column == "size"
     assert config.sort_ascending is False
