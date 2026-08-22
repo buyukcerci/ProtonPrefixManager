@@ -130,6 +130,18 @@ class MainWindow(QMainWindow):
         message_layout.addWidget(self._message_icon_label, alignment=Qt.AlignmentFlag.AlignHCenter)
         message_layout.addWidget(self._message_label)
         message_layout.addStretch(1)
+        message_palette = self._message_page.palette()
+        message_palette.setColor(
+            message_palette.ColorRole.WindowText,
+            message_palette.color(message_palette.ColorRole.WindowText),
+        )
+        message_palette.setColor(
+            message_palette.ColorRole.Window,
+            message_palette.color(message_palette.ColorRole.Window),
+        )
+        self._message_page.setPalette(message_palette)
+        self._message_label.setPalette(message_palette)
+        self._message_icon_label.setPalette(message_palette)
 
         self._stack = QStackedWidget()
         self._stack.addWidget(message_page)
