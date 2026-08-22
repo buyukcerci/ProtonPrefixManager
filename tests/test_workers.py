@@ -7,11 +7,12 @@ from pathlib import Path
 import pytest
 
 from core import opener as opener_module
+from core.deletion import DeleteMode
 from core.discovery import RootSource
 from core.models import Prefix, PrefixType
 from core.opener import OpenStatus
 from core.scanner import ScanEventKind, cache_key
-from ui.workers import DiscoveryWorker, OpenFolderWorker, ScanWorker
+from ui.workers import DeletionWorker, DiscoveryWorker, OpenFolderWorker, ScanWorker
 
 
 def _fixture_home(tmp_path: Path) -> tuple[Path, Path]:
@@ -111,3 +112,86 @@ def test_open_folder_worker_existing_and_missing(
     opened, missed = results
     assert opened.status is OpenStatus.OPENED  # type: ignore[attr-defined]
     assert missed.status is OpenStatus.MISSING_PATH  # type: ignore[attr-defined]
+
+
+def test_deletion_worker_streams_results(
+    qtbot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from core import deletion as deletion_module
+    from core.discovery import Library
+
+    calls: list[Path] = []
+
+    def fake_send2trash(path: Path) -> None:
+        calls.append(path)
+
+    monkeypatch.setattr(deletion_module, "send2trash", fake_send2trash)
+    library_path = tmp_path / "lib"
+    compatdata = library_path / "steamapps" / "compatdata"
+    prefixes = []
+    for app_id in (10, 20):
+        target = compatdata / str(app_id)
+        target.mkdir(parents=True)
+        prefixes.append(
+            Prefix(
+                app_id=app_id,
+                name=f"G{app_id}",
+                prefix_type=PrefixType.ORPHANED,
+                path=target,
+                library=str(library_path),
+            )
+        )
+    library = Library(path=library_path.resolve(), root=tmp_path.resolve())
+
+    worker = DeletionWorker(prefixes, [library], DeleteMode.TRASH, epoch=9)
+    events: list[tuple[object, int]] = []
+    worker.signals.result_ready.connect(lambda r, e: events.append((r, e)))
+    with qtbot.waitSignal(worker.signals.finished, timeout=10000) as blocker:
+        QThreadPool_start(worker)
+
+    finished_epoch = blocker.args[0]
+    assert finished_epoch == 9
+    assert [epoch for _, epoch in events] == [9, 9]
+    results = [r for r, _ in events]
+    assert all(r.status.value == "deleted" for r in results)
+    assert calls == [prefixes[0].path.resolve(), prefixes[1].path.resolve()]
+
+
+def test_deletion_worker_isolates_permission_failure(
+    qtbot, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from core import deletion as deletion_module
+    from core.deletion import DeletionStatus
+    from core.discovery import Library
+
+    def failing(path: Path) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(deletion_module, "send2trash", failing)
+    library_path = tmp_path / "lib"
+    compatdata = library_path / "steamapps" / "compatdata"
+    prefixes = []
+    for app_id in (1, 2):
+        target = compatdata / str(app_id)
+        target.mkdir(parents=True)
+        prefixes.append(
+            Prefix(
+                app_id=app_id,
+                name=f"G{app_id}",
+                prefix_type=PrefixType.ORPHANED,
+                path=target,
+                library=str(library_path),
+            )
+        )
+    library = Library(path=library_path.resolve(), root=tmp_path.resolve())
+
+    worker = DeletionWorker(prefixes, [library], DeleteMode.TRASH, epoch=4)
+    events: list[tuple[object, int]] = []
+    worker.signals.result_ready.connect(lambda r, e: events.append((r, e)))
+    with qtbot.waitSignal(worker.signals.finished, timeout=10000):
+        QThreadPool_start(worker)
+
+    statuses = [r.status for r, _ in events]
+    assert DeletionStatus.FAILED in statuses
+    failed = next(r for r, _ in events if r.status is DeletionStatus.FAILED)
+    assert failed.failure_kind is not None and failed.error is not None

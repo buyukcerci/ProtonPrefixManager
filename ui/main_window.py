@@ -4,28 +4,49 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from PySide6.QtCore import QRunnable, Qt, QThreadPool
+from PySide6.QtCore import QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
+    QFrame,
+    QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
+    QPushButton,
     QStackedWidget,
     QStatusBar,
     QStyle,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from core.config import load_config, save_config
-from core.discovery import DiscoveryResult
-from core.models import Prefix, ScanStatus, Store
+from core.deletion import DeleteMode, DeletionResult, DeletionStatus
+from core.discovery import DiscoveryResult, Library
+from core.models import Prefix, PrefixType, ScanStatus, Store, format_size
 from core.opener import OpenStatus, can_open
-from core.scanner import ScanEvent, ScanEventKind, cache_key, load_cached, refresh_needed
+from core.scanner import (
+    ScanEvent,
+    ScanEventKind,
+    cache_key,
+    invalidate,
+    load_cached,
+    refresh_needed,
+)
+from ui.dialogs import (
+    confirm_final,
+    confirm_selection,
+    show_deletion_summary,
+    unscanned_note_for,
+)
 from ui.styles import (
     MESSAGE_ICON_SIZE_PX,
     MESSAGE_LAYOUT_SPACING_PX,
     MESSAGE_PAGE_MARGIN_PX,
+    SEARCH_DEBOUNCE_MS,
 )
 from ui.table import (
     OPEN_COLUMN,
@@ -34,7 +55,7 @@ from ui.table import (
     PrefixTable,
     PrefixTableModel,
 )
-from ui.workers import DiscoveryWorker, OpenFolderWorker, ScanWorker
+from ui.workers import DeletionWorker, DiscoveryWorker, OpenFolderWorker, ScanWorker
 
 _PAGE_MESSAGE = 0
 _PAGE_TABLE = 1
@@ -48,9 +69,18 @@ _NO_ROWS_TEXT = "No prefixes match the current view."
 
 _SCAN_WAIT_MS = 2000
 
+_TYPE_LABELS = {
+    PrefixType.STEAM: "Steam Games",
+    PrefixType.NON_STEAM: "Non-Steam Games",
+    PrefixType.ORPHANED: "Orphaned",
+}
+_SEARCH_TARGETS = {"name": "Name", "app_id": "AppID"}
+
 
 class MainWindow(QMainWindow):
     """Root window hosting the prefix table and its background pipelines."""
+
+    search_applied = Signal()
 
     def __init__(self, auto_start: bool = True) -> None:
         super().__init__()
@@ -66,6 +96,15 @@ class MainWindow(QMainWindow):
         self._scan_errors: dict[str, str] = {}
         self._sort_key = self._config.sort_column
         self._sort_descending = not self._config.sort_ascending
+        self._libraries: list[Library] = []
+        self._filter_types: set[PrefixType] = set(self._config.type_filter)
+        self._search_text = ""
+        self._search_target = "name"
+        self._deleting = False
+        self._delete_total = 0
+        self._delete_done = 0
+        self._deletion_results: list[DeletionResult] = []
+        self._delete_mode: DeleteMode | None = None
 
         self._model = PrefixTableModel(error_provider=self._scan_error_for)
         self._table = PrefixTable(self._model)
@@ -77,7 +116,8 @@ class MainWindow(QMainWindow):
         self._message_label = QLabel()
         self._message_label.setWordWrap(True)
         self._message_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        message_page = QWidget()
+        self._message_page = QWidget()
+        message_page = self._message_page
         message_layout = QVBoxLayout(message_page)
         message_layout.setContentsMargins(
             MESSAGE_PAGE_MARGIN_PX,
@@ -87,9 +127,9 @@ class MainWindow(QMainWindow):
         )
         message_layout.setSpacing(MESSAGE_LAYOUT_SPACING_PX)
         message_layout.addStretch(1)
-        message_layout.addWidget(self._message_icon_label)
+        message_layout.addWidget(self._message_icon_label, alignment=Qt.AlignmentFlag.AlignHCenter)
         message_layout.addWidget(self._message_label)
-        message_layout.addStretch(2)
+        message_layout.addStretch(1)
 
         self._stack = QStackedWidget()
         self._stack.addWidget(message_page)
@@ -98,8 +138,15 @@ class MainWindow(QMainWindow):
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._build_filter_bar(container))
         layout.addWidget(self._stack)
+        layout.addWidget(self._build_action_bar(container))
         self.setCentralWidget(container)
+
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(SEARCH_DEBOUNCE_MS)
+        self._search_timer.timeout.connect(self._apply_filters)
 
         self._build_menu()
         self._status = QStatusBar()
@@ -108,24 +155,198 @@ class MainWindow(QMainWindow):
         self._table.sort_column_clicked.connect(self._on_sort_column_clicked)
         self._table.header_toggle_clicked.connect(self._on_header_toggle)
         self._table.clicked.connect(self._on_table_clicked)
+        self._model.header_state_changed.connect(lambda *_: self._update_delete_button())
 
         self._apply_initial_sort_indicator()
         if auto_start:
             self.refresh()
 
+    def _build_filter_bar(self, parent: QWidget) -> QWidget:
+        bar = QWidget(parent)
+        layout = QHBoxLayout(bar)
+        self._type_button = QToolButton(bar)
+        self._type_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self._type_button.setText("Filters")
+        type_menu = QMenu(self._type_button)
+        for prefix_type in (PrefixType.STEAM, PrefixType.NON_STEAM, PrefixType.ORPHANED):
+            action = type_menu.addAction(_TYPE_LABELS[prefix_type])
+            action.setCheckable(True)
+            action.setChecked(prefix_type in self._filter_types)
+            action.toggled.connect(
+                lambda checked, pt=prefix_type: self._on_type_toggled(pt, checked)
+            )
+        self._type_button.setMenu(type_menu)
+        self._type_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        layout.addWidget(self._type_button)
+
+        search_frame = QFrame(bar)
+        search_frame.setObjectName("searchFrame")
+        search_layout = QHBoxLayout(search_frame)
+        search_layout.setContentsMargins(0, 0, 0, 0)
+        search_layout.setSpacing(0)
+
+        self._target_combo = QComboBox(search_frame)
+        self._target_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        for value, label in _SEARCH_TARGETS.items():
+            self._target_combo.addItem(label, userData=value)
+        self._target_combo.currentIndexChanged.connect(self._on_search_target_changed)
+        search_layout.addWidget(self._target_combo)
+
+        self._search_box = QLineEdit(search_frame)
+        self._search_box.setClearButtonEnabled(True)
+        self._search_box.textChanged.connect(self._on_search_text_changed)
+        search_layout.addWidget(self._search_box, stretch=1)
+
+        layout.addWidget(search_frame, stretch=1)
+
+        self._update_type_summary()
+        self._update_search_placeholder()
+        return bar
+
+    def _build_action_bar(self, parent: QWidget) -> QWidget:
+        bar = QWidget(parent)
+        layout = QHBoxLayout(bar)
+        layout.addStretch(1)
+        self._delete_button = QPushButton(bar)
+        self._delete_button.clicked.connect(self._on_delete_clicked)
+        layout.addWidget(self._delete_button)
+        self._update_delete_button()
+        return bar
+
+    def _type_summary_text(self) -> str:
+        checked = [
+            pt
+            for pt in (PrefixType.STEAM, PrefixType.NON_STEAM, PrefixType.ORPHANED)
+            if pt in self._filter_types
+        ]
+        if not checked:
+            return "Types: None"
+        labels = [_TYPE_LABELS[pt].removesuffix(" Games") for pt in checked]
+        return "Types: " + " + ".join(labels)
+
+    def _update_type_summary(self) -> None:
+        self._type_button.setToolTip(self._type_summary_text())
+
+    def _update_search_placeholder(self) -> None:
+        placeholders = {"name": "Search names", "app_id": "Search AppIDs"}
+        self._search_box.setPlaceholderText(placeholders.get(self._search_target, "Search"))
+
+    def _on_type_toggled(self, prefix_type: PrefixType, checked: bool) -> None:
+        if checked:
+            self._filter_types.add(prefix_type)
+        else:
+            self._filter_types.discard(prefix_type)
+        self._config.type_filter = [
+            pt
+            for pt in (PrefixType.STEAM, PrefixType.NON_STEAM, PrefixType.ORPHANED)
+            if pt in self._filter_types
+        ]
+        self._update_type_summary()
+        self._apply_filters()
+        save_config(self._config)
+
+    def _on_search_text_changed(self, text: str) -> None:
+        self._search_text = text.strip()
+        self._search_timer.start()
+
+    def _on_search_target_changed(self, index: int) -> None:
+        value = self._target_combo.itemData(index)
+        if isinstance(value, str):
+            self._search_target = value
+            self._update_search_placeholder()
+            self._apply_filters()
+
+    def _apply_filters(self, *, rescan_openable: bool = True) -> None:
+        """Re-slice the Store through the current filters into the model."""
+        visible = self._store.filter(
+            types=self._filter_types,
+            search_text=self._search_text,
+            search_target=self._search_target,
+        )
+        self._model.set_rows(visible, rescan_openable=rescan_openable)
+        self._table.set_header_state(self._model.selection_state())
+        if visible:
+            self._stack.setCurrentIndex(_PAGE_TABLE)
+        elif self._store.prefixes and self._libraries:
+            self._show_message(_NO_ROWS_TEXT)
+        self.search_applied.emit()
+        self._update_delete_button()
+
+    def _selected_summary(self) -> tuple[list[str], str]:
+        selected = self._store.selected()
+        names = [prefix.name for prefix in selected]
+        total = sum(prefix.size_bytes for prefix in selected)
+        return names, format_size(total)
+
+    def _update_delete_button(self) -> None:
+        count = len(self._store.selected())
+        self._delete_button.setText(f"Delete Prefixes ({count})")
+        self._delete_button.setEnabled(count > 0 and not self._deleting)
+
+    def _on_delete_clicked(self) -> None:
+        selected = self._store.selected()
+        if not selected or self._deleting:
+            return
+        names, total_text = self._selected_summary()
+        if not confirm_selection(self, names, total_text, unscanned_note_for(selected)):
+            return
+        mode = confirm_final(self, len(selected), total_text)
+        if mode is None:
+            return
+        self._deleting = True
+        self._delete_total = len(selected)
+        self._delete_done = 0
+        self._deletion_results.clear()
+        self._delete_mode = mode
+        self._update_delete_button()
+        self._refresh_action.setEnabled(False)
+        self._status.showMessage(f"Deleting 0/{self._delete_total}")
+        epoch = self._epoch
+        worker = DeletionWorker(selected, self._libraries, mode, epoch)
+        self._workers.add(worker)
+        worker.signals.result_ready.connect(self._on_deletion_result)
+        worker.signals.finished.connect(lambda ep, w=worker: self._on_deletion_finished(ep, w))
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_deletion_result(self, result, epoch: int) -> None:
+        if epoch != self._epoch:
+            return
+        self._deletion_results.append(result)
+        self._delete_done += 1
+        self._status.showMessage(f"Deleting {self._delete_done}/{self._delete_total}")
+
+    def _on_deletion_finished(self, epoch: int, worker: QRunnable | None = None) -> None:
+        self._workers.discard(worker)
+        if epoch != self._epoch:
+            return
+        results = list(self._deletion_results)
+        for result in results:
+            if result.status is DeletionStatus.DELETED:
+                invalidate(self._config.size_cache, result.prefix)
+        save_config(self._config)
+        self._deleting = False
+        self._refresh_action.setEnabled(True)
+        self._update_delete_button()
+        self._status.clearMessage()
+        if any(r.status is not DeletionStatus.DELETED for r in results):
+            show_deletion_summary(self, results)
+        self.refresh()
+
     def _build_menu(self) -> None:
         menu_bar = self.menuBar()
         file_menu = QMenu("&File", self)
         menu_bar.addMenu(file_menu)
-        refresh_action = file_menu.addAction("&Refresh")
-        refresh_action.setShortcut("Ctrl+R")
-        refresh_action.triggered.connect(self.refresh)
+        self._refresh_action = file_menu.addAction("&Refresh")
+        self._refresh_action.setShortcut("Ctrl+R")
+        self._refresh_action.triggered.connect(self.refresh)
         quit_action = file_menu.addAction("&Quit")
         quit_action.setShortcut("Ctrl+Q")
         quit_action.triggered.connect(self.close)
 
     def refresh(self) -> None:
         """Start one full pipeline run; stale runs are dropped via the epoch."""
+        if self._deleting:
+            return
         self._epoch += 1
         epoch = self._epoch
         self._scan_errors.clear()
@@ -151,6 +372,7 @@ class MainWindow(QMainWindow):
         if result.errors:
             self._status.showMessage(f"discovery: {len(result.errors)} warnings", 5000)
         self._config.steam_roots = [str(root.path) for root in result.roots]
+        self._libraries = list(result.libraries)
 
         store = Store()
         store.merge(prefixes)
@@ -169,7 +391,6 @@ class MainWindow(QMainWindow):
             save_config(self._config)
             self._show_message(_NO_PREFIXES_TEXT)
             return
-        self._stack.setCurrentIndex(_PAGE_TABLE)
         self._apply_sort()
 
         pending = [
@@ -198,7 +419,7 @@ class MainWindow(QMainWindow):
             assert isinstance(event.prefix, Prefix)
             scanning = replace(event.prefix, scan_status=ScanStatus.SCANNING)
             self._store.upsert(scanning)
-            self._model.set_rows(self._store.prefixes, rescan_openable=False)
+            self._apply_filters(rescan_openable=False)
             return
         assert isinstance(event.prefix, Prefix)
         self._store.upsert(event.prefix)
@@ -209,7 +430,7 @@ class MainWindow(QMainWindow):
         if self._sort_key == "size":
             self._apply_sort()
         else:
-            self._model.set_rows(self._store.prefixes)
+            self._apply_filters(rescan_openable=False)
 
     def _on_scan_finished(self, epoch: int, worker: QRunnable | None = None) -> None:
         self._workers.discard(worker)
@@ -260,7 +481,8 @@ class MainWindow(QMainWindow):
             )
 
     def _apply_sort(self) -> None:
-        self._model.apply_sort(self._sort_key, descending=self._sort_descending)
+        self._store.sort(key=self._sort_key, descending=self._sort_descending)
+        self._apply_filters()
 
     def _apply_initial_sort_indicator(self) -> None:
         header = self._table.horizontalHeader()

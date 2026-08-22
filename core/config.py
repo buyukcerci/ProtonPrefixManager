@@ -14,7 +14,7 @@ CONFIG_DIR_NAME = "proton-prefix-manager"
 CONFIG_FILE_NAME = "config.json"
 CONFIG_VERSION = 1
 
-DEFAULT_TYPE_FILTER = [PrefixType.STEAM, PrefixType.NON_STEAM]
+DEFAULT_TYPE_FILTER = [PrefixType.STEAM, PrefixType.NON_STEAM, PrefixType.ORPHANED]
 VALID_SORT_COLUMNS = ("size", "name", "app_id", "path")
 
 
@@ -94,6 +94,8 @@ def _string_list(value: object) -> list[str]:
 def _type_filter(value: object) -> list[PrefixType]:
     if not isinstance(value, list):
         return list(DEFAULT_TYPE_FILTER)
+    if not value:
+        return []
     result: list[PrefixType] = []
     for item in value:
         if isinstance(item, str):
@@ -101,7 +103,7 @@ def _type_filter(value: object) -> list[PrefixType]:
                 result.append(PrefixType(item))
             except ValueError:
                 pass
-    return result or list(DEFAULT_TYPE_FILTER)
+    return result if result else list(DEFAULT_TYPE_FILTER)
 
 
 def _size_cache(value: object) -> dict[str, dict]:

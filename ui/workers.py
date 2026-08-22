@@ -12,7 +12,8 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, Signal
 
-from core.discovery import discover
+from core.deletion import DeleteMode, delete_prefixes
+from core.discovery import Library, discover
 from core.enumeration import enumerate_from_discovery
 from core.models import Prefix
 from core.opener import open_folder
@@ -61,6 +62,34 @@ class ScanWorker(QRunnable):
     def run(self) -> None:
         for event in scan_prefixes(self._prefixes, self._cache):
             self.signals.scan_event.emit(event, self.epoch)
+        self.signals.finished.emit(self.epoch)
+
+
+class DeletionSignals(QObject):
+    result_ready = Signal(object, int)
+    finished = Signal(int)
+
+
+class DeletionWorker(QRunnable):
+    """Runs delete_prefixes and streams one event per target."""
+
+    def __init__(
+        self,
+        prefixes: Sequence[Prefix],
+        libraries: Sequence[Library],
+        mode: DeleteMode,
+        epoch: int,
+    ) -> None:
+        super().__init__()
+        self._prefixes = list(prefixes)
+        self._libraries = list(libraries)
+        self._mode = mode
+        self.epoch = epoch
+        self.signals = DeletionSignals()
+
+    def run(self) -> None:
+        for result in delete_prefixes(self._prefixes, self._libraries, self._mode):
+            self.signals.result_ready.emit(result, self.epoch)
         self.signals.finished.emit(self.epoch)
 
 

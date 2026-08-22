@@ -133,7 +133,7 @@ def test_store_sort_unknown_key_raises() -> None:
         store.sort("bogus")
 
 
-def test_store_filter_by_type() -> None:
+def test_store_filter_by_type_strict_subset() -> None:
     store = Store()
     store.merge(
         [
@@ -142,8 +142,40 @@ def test_store_filter_by_type() -> None:
             _prefix(app_id=3, prefix_type=PrefixType.ORPHANED),
         ]
     )
-    result = store.filter(types=[PrefixType.STEAM])
-    assert [p.app_id for p in result] == [1]
+    assert [p.app_id for p in store.filter(types=[PrefixType.STEAM])] == [1]
+    assert [p.app_id for p in store.filter(types=[PrefixType.NON_STEAM])] == [2]
+    assert [p.app_id for p in store.filter(types=[PrefixType.ORPHANED])] == [3]
+    result = sorted(p.app_id for p in store.filter(types=[PrefixType.STEAM, PrefixType.ORPHANED]))
+    assert result == [1, 3]
+
+
+def test_store_filter_empty_type_set_yields_no_rows() -> None:
+    store = Store()
+    store.merge(
+        [
+            _prefix(app_id=1, prefix_type=PrefixType.STEAM),
+            _prefix(app_id=2, prefix_type=PrefixType.NON_STEAM),
+            _prefix(app_id=3, prefix_type=PrefixType.ORPHANED),
+        ]
+    )
+    assert store.filter(types=set()) == []
+
+
+def test_store_filter_search_narrows_orphans_when_included() -> None:
+    store = Store()
+    store.merge(
+        [
+            _prefix(app_id=111, name="Ghost One", prefix_type=PrefixType.ORPHANED),
+            _prefix(app_id=222, name="Ghost Two", prefix_type=PrefixType.ORPHANED),
+        ]
+    )
+    by_name = store.filter(types=[PrefixType.ORPHANED], search_text="ghost two")
+    by_app_id = store.filter(search_text="111", search_target="app_id")
+    assert [p.app_id for p in by_name] == [222]
+    assert [p.app_id for p in by_app_id] == [111]
+
+    excluded = store.filter(types=[PrefixType.STEAM], search_text="ghost")
+    assert excluded == []
 
 
 def test_store_filter_all_types_when_none() -> None:

@@ -21,7 +21,11 @@ def test_default_config_values() -> None:
     assert config.custom_roots == []
     assert config.font_family is None
     assert config.font_size == 10
-    assert config.type_filter == [PrefixType.STEAM, PrefixType.NON_STEAM]
+    assert config.type_filter == [
+        PrefixType.STEAM,
+        PrefixType.NON_STEAM,
+        PrefixType.ORPHANED,
+    ]
     assert config.sort_column == "size"
     assert config.sort_ascending is False
     assert config.size_cache == {}
@@ -101,7 +105,11 @@ def test_invalid_type_filter_items_revert_to_default(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
     path.write_text(json.dumps({"version": 1, "type_filter": ["bogus"]}), encoding="utf-8")
     config = load_config(path)
-    assert config.type_filter == [PrefixType.STEAM, PrefixType.NON_STEAM]
+    assert config.type_filter == [
+        PrefixType.STEAM,
+        PrefixType.NON_STEAM,
+        PrefixType.ORPHANED,
+    ]
 
 
 def test_unknown_keys_ignored(tmp_path: Path) -> None:

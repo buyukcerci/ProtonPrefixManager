@@ -23,6 +23,7 @@ MIN_HEADER_SECTION_PX = 28
 MESSAGE_ICON_SIZE_PX = 64
 MESSAGE_LAYOUT_SPACING_PX = 16
 MESSAGE_PAGE_MARGIN_PX = 32
+SEARCH_DEBOUNCE_MS = 300
 
 CHECK_WIDTH_PX = 28
 OPEN_WIDTH_PX = 32
@@ -40,6 +41,20 @@ QTableView::item {{
 QHeaderView::section {{
     padding: {HEADER_PADDING_PX}px {HEADER_H_PADDING_PX}px;
     font-weight: 600;
+}}
+QFrame#searchFrame {{
+    border: 1px solid palette(mid);
+    border-radius: 4px;
+}}
+QFrame#searchFrame QComboBox {{
+    border: none;
+    background: transparent;
+    padding: 2px 4px;
+}}
+QFrame#searchFrame QLineEdit {{
+    border: none;
+    background: transparent;
+    padding: 2px 4px;
 }}
 """
 
