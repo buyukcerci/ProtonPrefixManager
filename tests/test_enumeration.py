@@ -201,6 +201,16 @@ def test_symlinked_entry_skipped(tmp_path: Path) -> None:
     assert [prefix.app_id for prefix in prefixes] == [980]
 
 
+def test_real_format_shortcut_with_unsigned_appid(tmp_path: Path) -> None:
+    lib = _make_library(tmp_path, app_ids=(2455158483, 999999))
+    root = _make_shortcut_root(tmp_path / "root", {"1234": [(-1839808813, "Returnal.exe")]})
+    prefixes = enumerate_prefixes([lib], [root])
+    by_id = {p.app_id: p for p in prefixes}
+    assert by_id[2455158483].prefix_type is PrefixType.NON_STEAM
+    assert by_id[2455158483].name == "Returnal.exe"
+    assert by_id[999999].prefix_type is PrefixType.ORPHANED
+
+
 def test_enumerate_from_discovery_wires_result(tmp_path: Path) -> None:
     lib = _make_library(tmp_path, app_ids=(990,), manifests={990: "Wired"})
     result = DiscoveryResult(libraries=[lib])

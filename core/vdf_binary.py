@@ -1,11 +1,15 @@
 """Binary VDF parsing for userdata shortcuts.vdf.
 
-Implements the minimal subset of Valve's binary VDF format needed to read
-non-Steam shortcut entries: nested dictionaries (0x00), null-terminated
-UTF-8 strings (0x01), little-endian Int32 values (0x02), and dictionary end
-markers (0x08). Any other type byte fails closed with ShortcutsParseError.
-The TYPE_* constants expose this wire format and double as the fixture
-builder contract used by the test suite.
+Real Steam writes a single top-level field ``0x00 "shortcuts" <entries>
+0x08`` where ``<entries>`` holds numbered shortcut dicts. The parser also
+accepts the legacy double-wrapped form that nests ``shortcuts`` inside an
+extra root dict, so old fixtures and third-party tools keep working. The
+implementation covers only the bytes the shortcuts file uses: nested
+dictionaries (0x00), null-terminated UTF-8 strings (0x01), little-endian
+Int32 values (0x02), and dictionary end markers (0x08). Any other type
+byte fails closed with ShortcutsParseError. The TYPE_* constants expose
+this wire format and double as the fixture builder contract used by the
+test suite.
 """
 
 from __future__ import annotations
@@ -31,22 +35,33 @@ class ShortcutsParseError(ValueError):
 def parse_shortcuts_vdf_bytes(data: bytes) -> dict[int, str]:
     """Extract an appid -> AppName mapping from raw binary VDF bytes.
 
-    The root dictionary's "shortcuts" child is preferred when present;
-    otherwise the root itself is treated as the shortcuts collection. Entries
-    missing a usable appid or carrying an empty AppName are skipped. Shortcut
-    appids are stored as signed Int32 by Steam but appear as their unsigned
-    decimal form on disk, so negative values are normalized accordingly.
+    Real Steam stores a single named field ``shortcuts`` at the top level;
+    the parser also accepts a legacy double-wrapped form where ``shortcuts``
+    is nested inside an extra root dictionary. The field name is otherwise
+    ignored. Entries missing a usable appid or carrying an empty AppName are
+    skipped. Shortcut appids are stored as signed Int32 but appear as their
+    unsigned decimal form on disk, so negative values are normalized.
     Trailing bytes after the root dictionary are ignored.
     """
     if not data:
         return {}
     if data[0] != TYPE_DICT:
         raise ShortcutsParseError(f"unexpected root marker byte 0x{data[0]:02x}")
-    root, _ = _parse_dict(data, 1)
-    block = root.get(_SHORTCUTS_KEY)
-    if not isinstance(block, dict):
-        block = root
-    return _collect_shortcuts(block)
+    if len(data) >= 2 and data[1] == TYPE_END:
+        return {}
+    if len(data) >= 2 and data[1] == TYPE_DICT:
+        root, _ = _parse_dict(data, 1)
+        block = root.get(_SHORTCUTS_KEY)
+        if isinstance(block, dict):
+            return _collect_shortcuts(block)
+        return _collect_shortcuts(root)
+    name, pos = _read_string(data, 1)
+    del name
+    entries, _ = _parse_dict(data, pos)
+    block = entries.get(_SHORTCUTS_KEY)
+    if isinstance(block, dict):
+        return _collect_shortcuts(block)
+    return _collect_shortcuts(entries)
 
 
 def load_shortcuts_vdf(path: Path) -> dict[int, str]:

@@ -26,7 +26,7 @@ def _int32(value: int) -> bytes:
 
 
 def build_shortcuts_vdf(entries: list[tuple[int, str]]) -> bytes:
-    out = bytearray([TYPE_DICT, TYPE_DICT])
+    out = bytearray([TYPE_DICT])
     out += _cstr("shortcuts")
     for index, (app_id, name) in enumerate(entries):
         out.append(TYPE_DICT)
@@ -41,6 +41,60 @@ def build_shortcuts_vdf(entries: list[tuple[int, str]]) -> bytes:
         out += _cstr("Exe")
         out += _cstr(f'"{name}.exe"')
         out.append(TYPE_END)
+    out.append(TYPE_END)
+    return bytes(out)
+
+
+def _build_returnal_fixture() -> bytes:
+    out = bytearray([TYPE_DICT])
+    out += _cstr("shortcuts")
+    out.append(TYPE_DICT)
+    out += _cstr("0")
+    out.append(TYPE_INT32)
+    out += _cstr("appid")
+    out += _int32(-1839808813)
+    out.append(TYPE_STRING)
+    out += _cstr("AppName")
+    out += _cstr("Returnal.exe")
+    out.append(TYPE_STRING)
+    out += _cstr("Exe")
+    out += _cstr("/home/user/.local/share/Steam/steamapps/common/Returnal/Returnal.exe")
+    out.append(TYPE_STRING)
+    out += _cstr("StartDir")
+    out += _cstr("/home/user/.local/share/Steam/steamapps/common/Returnal/")
+    out.append(TYPE_STRING)
+    out += _cstr("icon")
+    out += _cstr("")
+    out.append(TYPE_STRING)
+    out += _cstr("ShortcutPath")
+    out += _cstr("")
+    out.append(TYPE_STRING)
+    out += _cstr("LaunchOptions")
+    out += _cstr("%command%")
+    for key in (
+        "IsHidden",
+        "AllowDesktopConfig",
+        "AllowOverlay",
+        "OpenVR",
+        "Devkit",
+        "DevkitGameID",
+        "DevkitOverrideAppID",
+    ):
+        out.append(TYPE_INT32)
+        out += _cstr(key)
+        out += _int32(0)
+    out.append(TYPE_INT32)
+    out += _cstr("LastPlayTime")
+    out += _int32(0)
+    out.append(TYPE_STRING)
+    out += _cstr("FlatpakAppID")
+    out += _cstr("")
+    out.append(TYPE_STRING)
+    out += _cstr("sortas")
+    out += _cstr("")
+    out.append(TYPE_DICT)
+    out += _cstr("tags")
+    out.append(TYPE_END)
     out.append(TYPE_END)
     out.append(TYPE_END)
     return bytes(out)
@@ -84,6 +138,28 @@ def test_negative_appid_normalized_to_unsigned() -> None:
     assert parse_shortcuts_vdf_bytes(data) == {2**32 - 1: "Huge Shortcut"}
 
 
+def test_real_world_returnal_fixture() -> None:
+    data = _build_returnal_fixture()
+    assert parse_shortcuts_vdf_bytes(data) == {2455158483: "Returnal.exe"}
+
+
+def test_legacy_double_wrapped_form_still_parses() -> None:
+    out = bytearray([TYPE_DICT, TYPE_DICT])
+    out += _cstr("shortcuts")
+    out.append(TYPE_DICT)
+    out += _cstr("0")
+    out.append(TYPE_INT32)
+    out += _cstr("appid")
+    out += _int32(123)
+    out.append(TYPE_STRING)
+    out += _cstr("AppName")
+    out += _cstr("Legacy Game")
+    out.append(TYPE_END)
+    out.append(TYPE_END)
+    out.append(TYPE_END)
+    assert parse_shortcuts_vdf_bytes(bytes(out)) == {123: "Legacy Game"}
+
+
 def test_truncated_string_raises() -> None:
     data = build_shortcuts_vdf([(1, "Game")])
     truncated = data[: len(data) - 2]
@@ -105,7 +181,14 @@ def test_missing_end_marker_raises() -> None:
 
 
 def test_invalid_type_byte_raises() -> None:
-    data = bytes([TYPE_DICT, TYPE_DICT]) + _cstr("shortcuts") + bytes([0x63]) + _cstr("0")
+    data = (
+        bytes([TYPE_DICT])
+        + _cstr("shortcuts")
+        + bytes([TYPE_DICT])
+        + _cstr("0")
+        + bytes([0x63])
+        + _cstr("x")
+    )
     with pytest.raises(ShortcutsParseError):
         parse_shortcuts_vdf_bytes(data)
 
@@ -122,7 +205,7 @@ def test_extra_trailing_bytes_after_root_ignored() -> None:
 
 def test_entry_without_appid_skipped() -> None:
     data = (
-        bytes([TYPE_DICT, TYPE_DICT])
+        bytes([TYPE_DICT])
         + _cstr("shortcuts")
         + bytes([TYPE_DICT])
         + _cstr("0")
@@ -130,14 +213,14 @@ def test_entry_without_appid_skipped() -> None:
         + _cstr("AppName")
         + _cstr("No AppId Here")
         + bytes([TYPE_END])
-        + bytes([TYPE_END, TYPE_END])
+        + bytes([TYPE_END])
     )
     assert parse_shortcuts_vdf_bytes(data) == {}
 
 
 def test_string_appid_skipped() -> None:
     data = (
-        bytes([TYPE_DICT, TYPE_DICT])
+        bytes([TYPE_DICT])
         + _cstr("shortcuts")
         + bytes([TYPE_DICT])
         + _cstr("0")
@@ -145,19 +228,19 @@ def test_string_appid_skipped() -> None:
         + _cstr("appid")
         + _cstr("not-a-number")
         + bytes([TYPE_END])
-        + bytes([TYPE_END, TYPE_END])
+        + bytes([TYPE_END])
     )
     assert parse_shortcuts_vdf_bytes(data) == {}
 
 
 def test_non_dict_values_in_block_ignored() -> None:
     data = (
-        bytes([TYPE_DICT, TYPE_DICT])
+        bytes([TYPE_DICT])
         + _cstr("shortcuts")
         + bytes([TYPE_STRING])
         + _cstr("note")
         + _cstr("just a string")
-        + bytes([TYPE_END, TYPE_END])
+        + bytes([TYPE_END])
     )
     assert parse_shortcuts_vdf_bytes(data) == {}
 
