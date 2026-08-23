@@ -325,3 +325,101 @@ def test_enumerated_prefixes_flow_through_scan_and_cache(tmp_path: Path) -> None
     entry = CacheEntry.from_dict(cache.get(cache_key(scanned)))
     assert entry is not None
     assert entry.size_bytes == 25
+
+
+# --- modified tracking -----------------------------------------------------
+
+
+def test_scan_prefix_tracks_newest_file_mtime(tmp_path: Path) -> None:
+    target = tmp_path / "pfx"
+    _write_file(target / "old.bin", 10)
+    _write_file(target / "new.bin", 20)
+    newest = datetime(2026, 4, 1, 10, 30, 0, tzinfo=UTC)
+    older = datetime(2025, 4, 1, 10, 30, 0, tzinfo=UTC)
+    os.utime(target / "old.bin", (older.timestamp(), older.timestamp()))
+    os.utime(target / "new.bin", (newest.timestamp(), newest.timestamp()))
+    result = scan_prefix(target)
+    assert result.modified is not None
+    assert abs(result.modified.timestamp() - newest.timestamp()) < 1
+
+
+def test_scan_prefix_modified_none_on_empty_tree(tmp_path: Path) -> None:
+    assert scan_prefix(tmp_path / "pfx").modified is None
+
+
+def test_cache_round_trip_carries_modified(tmp_path: Path) -> None:
+    prefix = _make_prefix(tmp_path)
+    modified = datetime(2026, 4, 1, 9, 0, 0, tzinfo=UTC)
+    scanned = replace(
+        _scanned_copy(prefix, size_bytes=64),
+        modified=modified,
+    )
+    cache: dict[str, dict] = {}
+    save_cached(cache, scanned)
+    assert cache[cache_key(scanned)]["modified"] == modified.isoformat()
+    loaded = load_cached(cache, prefix)
+    assert loaded is not None
+    assert loaded.modified == modified
+
+
+def test_cache_round_trip_omits_modified_when_unknown(tmp_path: Path) -> None:
+    prefix = _make_prefix(tmp_path)
+    scanned = _scanned_copy(prefix, size_bytes=64)
+    cache: dict[str, dict] = {}
+    save_cached(cache, scanned)
+    assert "modified" not in cache[cache_key(scanned)]
+    loaded = load_cached(cache, prefix)
+    assert loaded is not None
+    assert loaded.modified is None
+
+
+def test_cache_entries_without_modified_key_stay_valid(tmp_path: Path) -> None:
+    prefix = _make_prefix(tmp_path)
+    scanned = _scanned_copy(prefix, size_bytes=32)
+    cache: dict[str, dict] = {}
+    save_cached(cache, scanned)
+    legacy = dict(cache[cache_key(scanned)])
+    legacy.pop("modified", None)  # simulate an entry written before the field existed
+    cache[cache_key(scanned)] = legacy
+    assert refresh_needed(cache, prefix) is False
+    entry = CacheEntry.from_dict(legacy)
+    assert entry is not None
+    assert entry.modified is None
+
+
+def test_cache_entry_treats_unusable_modified_as_none() -> None:
+    """Any unusable "modified" value keeps the entry and its cached size."""
+    for bad in (17, True, [], {}):
+        parsed = CacheEntry.from_dict(
+            {"size_bytes": 5, "last_scanned": "2026-01-01T00:00:00+00:00", "modified": bad}
+        )
+        assert parsed is not None
+        assert parsed.size_bytes == 5
+        assert parsed.modified is None
+    parsed = CacheEntry.from_dict(
+        {"size_bytes": 5, "last_scanned": "2026-01-01T00:00:00+00:00", "modified": "garbage"}
+    )
+    assert parsed is not None
+    assert parsed.modified is None
+    good = CacheEntry.from_dict(
+        {
+            "size_bytes": 5,
+            "last_scanned": "2026-01-01T00:00:00+00:00",
+            "modified": "2026-02-01T00:00:00+00:00",
+        }
+    )
+    assert good is not None
+    assert good.modified == datetime(2026, 2, 1, tzinfo=UTC)
+
+
+def test_scan_events_carry_modified(tmp_path: Path) -> None:
+    prefix = _make_prefix(tmp_path, name="pfx", app_id=77)
+    newest = datetime(2026, 2, 2, 2, 2, 2, tzinfo=UTC)
+    _write_file(prefix.path / "data.bin", 8)
+    os.utime(prefix.path / "data.bin", (newest.timestamp(), newest.timestamp()))
+    cache: dict[str, dict] = {}
+    events = list(scan_prefixes([prefix], cache))
+    completed = events[-1].prefix
+    assert isinstance(completed, Prefix)
+    assert completed.modified is not None
+    assert abs(completed.modified.timestamp() - newest.timestamp()) < 1

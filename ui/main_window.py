@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import replace
 
 from PySide6.QtCore import QRunnable, Qt, QThreadPool, QTimer, Signal
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -23,10 +25,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from core.analytics import storage_capacity
 from core.config import load_config, save_config
 from core.deletion import DeleteMode, DeletionResult, DeletionStatus
 from core.discovery import DiscoveryResult, Library
-from core.models import Prefix, PrefixType, ScanStatus, Store, format_size
+from core.models import Prefix, PrefixType, ScanStatus, Store, format_size, prefix_key
 from core.opener import OpenStatus, can_open
 from core.scanner import (
     ScanEvent,
@@ -42,6 +45,7 @@ from ui.dialogs import (
     show_deletion_summary,
     unscanned_note_for,
 )
+from ui.overview import OverviewPage
 from ui.styles import (
     MESSAGE_ICON_SIZE_PX,
     MESSAGE_LAYOUT_SPACING_PX,
@@ -58,7 +62,13 @@ from ui.table import (
 from ui.workers import DeletionWorker, DiscoveryWorker, OpenFolderWorker, ScanWorker
 
 _PAGE_MESSAGE = 0
-_PAGE_TABLE = 1
+_PAGE_CONTENT = 1
+
+_PAGE_OVERVIEW = 0
+_PAGE_PREFIXES = 1
+
+_INNER_PAGE_MESSAGE = 0
+_INNER_PAGE_TABLE = 1
 
 _NO_ROOTS_TEXT = (
     "No valid Steam root was found.\n"
@@ -105,6 +115,10 @@ class MainWindow(QMainWindow):
         self._delete_done = 0
         self._deletion_results: list[DeletionResult] = []
         self._delete_mode: DeleteMode | None = None
+        self._disk_capacity: int | None = None
+        self._pending_filter_reset = False
+        self._pending_select_all_visible = False
+        self._pending_highlight_key: tuple[int, str] | None = None
 
         self._model = PrefixTableModel(error_provider=self._scan_error_for)
         self._table = PrefixTable(self._model)
@@ -143,17 +157,61 @@ class MainWindow(QMainWindow):
         self._message_label.setPalette(message_palette)
         self._message_icon_label.setPalette(message_palette)
 
+        self._inner_message_icon_label = QLabel()
+        self._inner_message_icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._inner_message_icon_label.setFixedSize(MESSAGE_ICON_SIZE_PX, MESSAGE_ICON_SIZE_PX)
+        self._inner_message_label = QLabel()
+        self._inner_message_label.setWordWrap(True)
+        self._inner_message_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._inner_message_page = QWidget()
+        inner_message_layout = QVBoxLayout(self._inner_message_page)
+        inner_message_layout.setContentsMargins(
+            MESSAGE_PAGE_MARGIN_PX,
+            MESSAGE_PAGE_MARGIN_PX,
+            MESSAGE_PAGE_MARGIN_PX,
+            MESSAGE_PAGE_MARGIN_PX,
+        )
+        inner_message_layout.setSpacing(MESSAGE_LAYOUT_SPACING_PX)
+        inner_message_layout.addStretch(1)
+        inner_message_layout.addWidget(
+            self._inner_message_icon_label, alignment=Qt.AlignmentFlag.AlignHCenter
+        )
+        inner_message_layout.addWidget(self._inner_message_label)
+        inner_message_layout.addStretch(1)
+        inner_message_palette = self._inner_message_page.palette()
+        self._inner_message_page.setPalette(inner_message_palette)
+        self._inner_message_label.setPalette(inner_message_palette)
+        self._inner_message_icon_label.setPalette(inner_message_palette)
+
+        self._inner_stack = QStackedWidget()
+        self._inner_stack.addWidget(self._inner_message_page)
+        self._inner_stack.addWidget(self._table)
+
+        prefixes_page = QWidget()
+        prefixes_layout = QVBoxLayout(prefixes_page)
+        prefixes_layout.setContentsMargins(0, 0, 0, 0)
+        prefixes_layout.addWidget(self._build_filter_bar(prefixes_page))
+        prefixes_layout.addWidget(self._inner_stack)
+        prefixes_layout.addWidget(self._build_action_bar(prefixes_page))
+
+        self._overview = OverviewPage()
+        self._overview.orphan_review_requested.connect(self._on_orphan_review_requested)
+        self._overview.prefix_focus_requested.connect(self._on_prefix_focus_requested)
+
+        self._pages = QStackedWidget()
+        self._pages.addWidget(self._overview)
+        self._pages.addWidget(prefixes_page)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.addWidget(self._build_nav_bar(content))
+        content_layout.addWidget(self._pages)
+
         self._stack = QStackedWidget()
         self._stack.addWidget(message_page)
-        self._stack.addWidget(self._table)
-
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self._build_filter_bar(container))
-        layout.addWidget(self._stack)
-        layout.addWidget(self._build_action_bar(container))
-        self.setCentralWidget(container)
+        self._stack.addWidget(content)
+        self.setCentralWidget(self._stack)
 
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
@@ -173,6 +231,32 @@ class MainWindow(QMainWindow):
         if auto_start:
             self.refresh()
 
+    def _build_nav_bar(self, parent: QWidget) -> QWidget:
+        bar = QWidget(parent)
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        self._nav_group = QButtonGroup(bar)
+        self._nav_group.setExclusive(True)
+        self._overview_button = QToolButton(bar)
+        self._overview_button.setText("Overview")
+        self._overview_button.setCheckable(True)
+        self._prefixes_button = QToolButton(bar)
+        self._prefixes_button.setText("Prefixes")
+        self._prefixes_button.setCheckable(True)
+        self._nav_group.addButton(self._overview_button, _PAGE_OVERVIEW)
+        self._nav_group.addButton(self._prefixes_button, _PAGE_PREFIXES)
+        self._overview_button.setChecked(True)
+        layout.addWidget(self._overview_button)
+        layout.addWidget(self._prefixes_button)
+        layout.addStretch(1)
+        self._nav_group.idToggled.connect(self._on_nav_toggled)
+        return bar
+
+    def _on_nav_toggled(self, identifier: int, checked: bool) -> None:
+        if checked:
+            self._pages.setCurrentIndex(identifier)
+
     def _build_filter_bar(self, parent: QWidget) -> QWidget:
         bar = QWidget(parent)
         layout = QHBoxLayout(bar)
@@ -180,6 +264,7 @@ class MainWindow(QMainWindow):
         self._type_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self._type_button.setText("Filters")
         type_menu = QMenu(self._type_button)
+        self._type_actions: dict[PrefixType, QAction] = {}
         for prefix_type in (PrefixType.STEAM, PrefixType.NON_STEAM, PrefixType.ORPHANED):
             action = type_menu.addAction(_TYPE_LABELS[prefix_type])
             action.setCheckable(True)
@@ -187,6 +272,7 @@ class MainWindow(QMainWindow):
             action.toggled.connect(
                 lambda checked, pt=prefix_type: self._on_type_toggled(pt, checked)
             )
+            self._type_actions[prefix_type] = action
         self._type_button.setMenu(type_menu)
         self._type_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         layout.addWidget(self._type_button)
@@ -278,9 +364,12 @@ class MainWindow(QMainWindow):
         self._model.set_rows(visible, rescan_openable=rescan_openable)
         self._table.set_header_state(self._model.selection_state())
         if visible:
-            self._stack.setCurrentIndex(_PAGE_TABLE)
+            self._inner_stack.setCurrentIndex(_INNER_PAGE_TABLE)
+            self._stack.setCurrentIndex(_PAGE_CONTENT)
         elif self._store.prefixes and self._libraries:
-            self._show_message(_NO_ROWS_TEXT)
+            self._show_inner_message(_NO_ROWS_TEXT)
+            self._inner_stack.setCurrentIndex(_INNER_PAGE_MESSAGE)
+            self._stack.setCurrentIndex(_PAGE_CONTENT)
         self.search_applied.emit()
         self._update_delete_button()
 
@@ -394,6 +483,10 @@ class MainWindow(QMainWindow):
                 store.upsert(cached)
         self._store = store
         self._model.set_store(store)
+        self._disk_capacity = storage_capacity(
+            [library.path for library in self._libraries]
+        ).total_bytes
+        self._overview.update_data(store.prefixes, self._disk_capacity)
 
         if not result.roots:
             save_config(self._config)
@@ -443,6 +536,7 @@ class MainWindow(QMainWindow):
             self._apply_sort()
         else:
             self._apply_filters(rescan_openable=False)
+        self._overview.update_data(self._store.prefixes, self._disk_capacity)
 
     def _on_scan_finished(self, epoch: int, worker: QRunnable | None = None) -> None:
         self._workers.discard(worker)
@@ -470,6 +564,74 @@ class MainWindow(QMainWindow):
     def _on_header_toggle(self) -> None:
         self._model.toggle_visible_selection()
         self._table.set_header_state(self._model.selection_state())
+
+    def _set_type_filter(self, types: set[PrefixType]) -> None:
+        """Replace the active type filter, syncing menu checks and config."""
+        self._filter_types = set(types)
+        self._config.type_filter = [
+            prefix_type for prefix_type in PrefixType if prefix_type in self._filter_types
+        ]
+        for prefix_type, action in self._type_actions.items():
+            action.blockSignals(True)
+            action.setChecked(prefix_type in self._filter_types)
+            action.blockSignals(False)
+        self._update_type_summary()
+        save_config(self._config)
+
+    def _set_page(self, index: int) -> None:
+        self._pages.setCurrentIndex(index)
+        for button, page in (
+            (self._overview_button, _PAGE_OVERVIEW),
+            (self._prefixes_button, _PAGE_PREFIXES),
+        ):
+            button.blockSignals(True)
+            button.setChecked(page == index)
+            button.blockSignals(False)
+
+    def _on_prefix_focus_requested(self, prefix: object) -> None:
+        if not isinstance(prefix, Prefix):
+            return
+        self._pending_filter_reset = True
+        self._pending_select_all_visible = False
+        self._pending_highlight_key = prefix_key(prefix)
+        self._set_page(_PAGE_PREFIXES)
+        self._run_pending_handoff()
+
+    def _on_orphan_review_requested(self) -> None:
+        self._pending_filter_reset = False
+        self._pending_select_all_visible = True
+        self._pending_highlight_key = None
+        self._set_type_filter({PrefixType.ORPHANED})
+        self._set_page(_PAGE_PREFIXES)
+        self._run_pending_handoff()
+
+    def _run_pending_handoff(self) -> None:
+        """Carry handoff intent through the window, never through route parameters."""
+        if self._pending_filter_reset:
+            self._pending_filter_reset = False
+            self._set_type_filter(set(PrefixType))
+            self._search_text = ""
+            self._search_box.blockSignals(True)
+            self._search_box.clear()
+            self._search_box.blockSignals(False)
+            self._search_timer.stop()
+            self._update_search_placeholder()
+        if self._pending_select_all_visible:
+            self._pending_select_all_visible = False
+            self._apply_filters()
+            self._store.select_visible(self._model.rows())
+            self._model.refresh_all_check_states()
+            self._table.set_header_state(self._model.selection_state())
+        key = self._pending_highlight_key
+        if key is not None:
+            self._pending_highlight_key = None
+            self._apply_filters()
+            for row, row_prefix in enumerate(self._model.rows()):
+                if prefix_key(row_prefix) == key:
+                    self._table.scrollTo(self._model.index(row, 0))
+                    self._model.highlight_row(row_prefix)
+                    break
+        self._update_delete_button()
 
     def _on_table_clicked(self, index) -> None:
         if index.column() != OPEN_COLUMN:
@@ -513,6 +675,14 @@ class MainWindow(QMainWindow):
                 icon.pixmap(MESSAGE_ICON_SIZE_PX, MESSAGE_ICON_SIZE_PX)
             )
         self._stack.setCurrentIndex(_PAGE_MESSAGE)
+
+    def _show_inner_message(self, text: str) -> None:
+        self._inner_message_label.setText(text)
+        if QApplication.instance() is not None:
+            icon = QApplication.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation)
+            self._inner_message_icon_label.setPixmap(
+                icon.pixmap(MESSAGE_ICON_SIZE_PX, MESSAGE_ICON_SIZE_PX)
+            )
 
     def _update_progress_text(self) -> None:
         if self._scan_total <= 0:

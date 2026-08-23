@@ -15,7 +15,7 @@ CONFIG_FILE_NAME = "config.json"
 CONFIG_VERSION = 1
 
 DEFAULT_TYPE_FILTER = [PrefixType.STEAM, PrefixType.NON_STEAM, PrefixType.ORPHANED]
-VALID_SORT_COLUMNS = ("size", "name", "app_id", "path")
+VALID_SORT_COLUMNS = ("size", "name", "app_id", "path", "modified")
 
 
 def config_path() -> Path:

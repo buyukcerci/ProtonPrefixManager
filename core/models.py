@@ -54,6 +54,7 @@ class Prefix:
     size_bytes: int = 0
     scan_status: ScanStatus = ScanStatus.NOT_SCANNED
     last_scanned: datetime | None = None
+    modified: datetime | None = None
 
     @property
     def is_orphan(self) -> bool:
@@ -75,8 +76,12 @@ def format_size(size_bytes: int) -> str:
     return result
 
 
-def _dedupe_key(prefix: Prefix) -> tuple[int, str]:
+def prefix_key(prefix: Prefix) -> tuple[int, str]:
+    """Stable identity for a prefix across refreshed copies."""
     return (prefix.app_id, str(prefix.path).rstrip("/"))
+
+
+_dedupe_key = prefix_key
 
 
 class Store:
@@ -132,8 +137,30 @@ class Store:
             self._prefixes.sort(key=lambda p: p.name.casefold(), reverse=descending)
         elif key == "path":
             self._prefixes.sort(key=lambda p: str(p.path), reverse=descending)
+        elif key == "modified":
+            self._sort_by_modified(descending)
         else:
             raise ValueError(f"unknown sort key: {key}")
+
+    def _sort_by_modified(self, descending: bool) -> None:
+        """Sort on raw timestamps; unknown values always sort last.
+
+        Equal timestamps tie-break on size (larger first) then app_id so
+        the order stays deterministic in both directions.
+        """
+        ranked: list[tuple[float, int, int, Prefix]] = []
+        unknown: list[Prefix] = []
+        for prefix in self._prefixes:
+            modified = prefix.modified
+            if modified is None:
+                unknown.append(prefix)
+            else:
+                ranked.append((modified.timestamp(), prefix.size_bytes, prefix.app_id, prefix))
+        if descending:
+            ranked.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        else:
+            ranked.sort(key=lambda item: (item[0], -item[1], item[2]))
+        self._prefixes[:] = [item[3] for item in ranked] + unknown
 
     def select(self, prefix: Prefix) -> None:
         self._selected.add(_dedupe_key(prefix))

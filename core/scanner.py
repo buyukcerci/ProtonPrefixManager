@@ -1,9 +1,10 @@
 """Safe prefix size scanning with a path-keyed size cache.
 
 The scanner walks prefix directories without ever following symlinks,
-counts regular files only, and isolates failures: an unreadable nested
-directory contributes zero rather than aborting, while an inaccessible
-prefix root produces a failed result instead of an exception. Cache
+counts regular files only while tracking their newest modification time,
+and isolates failures: an unreadable nested directory contributes zero
+rather than aborting, while an inaccessible prefix root produces a
+failed result instead of an exception. Cache
 helpers are pure dictionary operations; persistence stays the
 responsibility of AppConfig.save_config. Scanning runs in plain Python and
 never mutates its inputs, so callers can display the prefix list
@@ -42,13 +43,25 @@ class CacheEntry:
 
     size_bytes: int
     last_scanned: datetime
+    modified: datetime | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {"size_bytes": self.size_bytes, "last_scanned": self.last_scanned.isoformat()}
+        data: dict[str, object] = {
+            "size_bytes": self.size_bytes,
+            "last_scanned": self.last_scanned.isoformat(),
+        }
+        if self.modified is not None:
+            data["modified"] = self.modified.isoformat()
+        return data
 
     @classmethod
     def from_dict(cls, data: object) -> CacheEntry | None:
-        """Parse a raw cache mapping, returning None on any malformed value."""
+        """Parse a raw cache mapping, returning None on any malformed value.
+
+        A missing or unusable "modified" value parses as None so cache
+        entries written before that field existed, or with a corrupt one,
+        keep their valid cached size.
+        """
         if not isinstance(data, dict):
             return None
         size_bytes = data.get("size_bytes")
@@ -61,7 +74,14 @@ class CacheEntry:
             last_scanned = datetime.fromisoformat(raw_timestamp)
         except ValueError:
             return None
-        return cls(size_bytes=size_bytes, last_scanned=last_scanned)
+        raw_modified = data.get("modified")
+        modified: datetime | None = None
+        if isinstance(raw_modified, str):
+            try:
+                modified = datetime.fromisoformat(raw_modified)
+            except ValueError:
+                modified = None
+        return cls(size_bytes=size_bytes, last_scanned=last_scanned, modified=modified)
 
 
 @dataclass(slots=True)
@@ -86,6 +106,7 @@ class ScanResult:
     path: Path
     size_bytes: int = 0
     error: str | None = None
+    modified: datetime | None = None
 
 
 def cache_key(target: Prefix | Path) -> str:
@@ -104,6 +125,7 @@ def load_cached(cache: dict[str, dict], prefix: Prefix) -> Prefix | None:
         size_bytes=entry.size_bytes,
         scan_status=ScanStatus.SCANNED,
         last_scanned=entry.last_scanned,
+        modified=entry.modified,
     )
 
 
@@ -114,10 +136,13 @@ def save_cached(cache: dict[str, dict], prefix: Prefix) -> None:
     """
     if prefix.last_scanned is None:
         raise ValueError("cannot cache a prefix without last_scanned timestamp")
-    cache[cache_key(prefix)] = {
+    entry: dict[str, object] = {
         "size_bytes": prefix.size_bytes,
         "last_scanned": prefix.last_scanned.isoformat(),
     }
+    if prefix.modified is not None:
+        entry["modified"] = prefix.modified.isoformat()
+    cache[cache_key(prefix)] = entry
 
 
 def invalidate(cache: dict[str, dict], target: Prefix | Path) -> None:
@@ -145,6 +170,7 @@ def scan_prefix(path: Path) -> ScanResult:
     except OSError as exc:
         return ScanResult(path=path, size_bytes=0, error=str(exc))
     total = 0
+    newest_mtime: float | None = None
     stack: list[list[os.DirEntry[str]]] = [root_entries]
     while stack:
         for entry in stack.pop():
@@ -163,7 +189,10 @@ def scan_prefix(path: Path) -> ScanResult:
                     continue
             elif stat_module.S_ISREG(mode):
                 total += info.st_size
-    return ScanResult(path=path, size_bytes=total, error=None)
+                if newest_mtime is None or info.st_mtime > newest_mtime:
+                    newest_mtime = info.st_mtime
+    modified = datetime.fromtimestamp(newest_mtime, tz=UTC) if newest_mtime is not None else None
+    return ScanResult(path=path, size_bytes=total, error=None, modified=modified)
 
 
 def scan_prefixes(
@@ -217,6 +246,7 @@ def _scan_one(
         size_bytes=result.size_bytes,
         scan_status=ScanStatus.SCANNED,
         last_scanned=datetime.now(UTC),
+        modified=result.modified,
     )
     if cache is not None:
         save_cached(cache, scanned)

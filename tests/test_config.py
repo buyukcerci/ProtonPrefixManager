@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from core.config import (
+    VALID_SORT_COLUMNS,
     AppConfig,
     config_path,
     default_config,
@@ -153,3 +154,11 @@ def test_save_is_atomic_and_leaves_no_temp_files(tmp_path: Path) -> None:
     save_config(AppConfig(font_size=14), path)
     assert load_config(path).font_size == 14
     assert list(tmp_path.iterdir()) == [path]
+
+
+def test_modified_is_a_valid_sort_column(tmp_path: Path) -> None:
+    assert "modified" in VALID_SORT_COLUMNS
+    config = AppConfig(sort_column="modified")
+    path = tmp_path / "config.json"
+    save_config(config, path)
+    assert load_config(path).sort_column == "modified"

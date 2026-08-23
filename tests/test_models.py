@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from core.models import (
     SelectionState,
     Store,
     format_size,
+    prefix_key,
 )
 
 LIB = "/steam"
@@ -283,3 +285,70 @@ def test_store_selected_and_deselect() -> None:
     assert [p.app_id for p in store.selected()] == [1]
     store.deselect(first)
     assert store.selected() == []
+
+
+# --- modified sorting ------------------------------------------------------
+
+
+def _modified_prefix(
+    app_id: int,
+    modified: datetime | None,
+    size_bytes: int = 0,
+) -> Prefix:
+    prefix = _prefix(app_id=app_id, size_bytes=size_bytes)
+    return replace(prefix, modified=modified) if modified else prefix
+
+
+def test_prefix_modified_defaults_to_none() -> None:
+    assert _prefix(app_id=730).modified is None
+
+
+def test_prefix_key_is_stable_across_copies() -> None:
+    prefix = _prefix(app_id=480)
+    refreshed = replace(prefix, size_bytes=10)
+    assert prefix_key(prefix) == prefix_key(refreshed)
+
+
+def test_store_sort_by_modified_descending_on_raw_timestamps() -> None:
+    older = datetime(2026, 1, 1, 12, 0, 0)
+    newer = datetime(2026, 6, 1, 12, 0, 0)
+    store = Store()
+    store.merge(
+        [
+            _modified_prefix(1, older, size_bytes=500),
+            _modified_prefix(2, newer, size_bytes=10),
+            _modified_prefix(3, None, size_bytes=900),
+        ]
+    )
+    store.sort(key="modified", descending=True)
+    assert [p.app_id for p in store.prefixes] == [2, 1, 3]
+    store.sort(key="modified", descending=False)
+    assert [p.app_id for p in store.prefixes] == [1, 2, 3]
+
+
+def test_store_sort_by_modified_none_last_regardless_of_direction() -> None:
+    timestamps = [datetime(2026, 3, 1), datetime(2026, 1, 1), None, datetime(2026, 2, 1), None]
+    store = Store()
+    store.merge(
+        _modified_prefix(app_id, modified) for app_id, modified in enumerate(timestamps, start=1)
+    )
+    store.sort(key="modified", descending=True)
+    assert [p.app_id for p in store.prefixes][-2:] == [3, 5]
+    store.sort(key="modified", descending=False)
+    assert [p.app_id for p in store.prefixes][-2:] == [3, 5]
+
+
+def test_store_sort_by_modified_ties_broken_by_size_then_app_id() -> None:
+    same = datetime(2026, 5, 5, 8, 30, 0)
+    store = Store()
+    store.merge(
+        [
+            _modified_prefix(1, same, size_bytes=10),
+            _modified_prefix(2, same, size_bytes=300),
+            _modified_prefix(3, same, size_bytes=300),
+        ]
+    )
+    store.sort(key="modified", descending=True)
+    assert [p.app_id for p in store.prefixes] == [2, 3, 1]
+    store.sort(key="modified", descending=False)
+    assert [p.app_id for p in store.prefixes] == [2, 3, 1]

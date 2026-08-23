@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from datetime import datetime
 
 from PySide6.QtCore import (
     QAbstractTableModel,
+    QDateTime,
+    QLocale,
     QModelIndex,
     QPersistentModelIndex,
     Qt,
+    QTimer,
     Signal,
 )
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QBrush, QIcon, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -22,12 +26,21 @@ from PySide6.QtWidgets import (
     QTableView,
 )
 
-from core.models import Prefix, ScanStatus, SelectionState, Store, format_size
+from core.models import (
+    Prefix,
+    ScanStatus,
+    SelectionState,
+    Store,
+    format_size,
+    prefix_key,
+)
 from ui.styles import (
     APP_ID_DEFAULT_PX,
     CHECK_WIDTH_PX,
     HEADER_HEIGHT_RATIO,
+    HIGHLIGHT_DURATION_MS,
     MIN_HEADER_SECTION_PX,
+    MODIFIED_DEFAULT_PX,
     NAME_DEFAULT_PX,
     OPEN_WIDTH_PX,
     SIZE_DEFAULT_PX,
@@ -40,14 +53,16 @@ NAME_COLUMN = 1
 APP_ID_COLUMN = 2
 PATH_COLUMN = 3
 SIZE_COLUMN = 4
-OPEN_COLUMN = 5
-COLUMN_COUNT = 6
+MODIFIED_COLUMN = 5
+OPEN_COLUMN = 6
+COLUMN_COUNT = 7
 
 SORTABLE_COLUMNS = {
     NAME_COLUMN: "name",
     APP_ID_COLUMN: "app_id",
     PATH_COLUMN: "path",
     SIZE_COLUMN: "size",
+    MODIFIED_COLUMN: "modified",
 }
 
 _HEADER_LABELS = {
@@ -55,10 +70,20 @@ _HEADER_LABELS = {
     APP_ID_COLUMN: "AppID",
     PATH_COLUMN: "Path",
     SIZE_COLUMN: "Size",
+    MODIFIED_COLUMN: "Modified",
 }
 
 _OPEN_DISABLED_TOOLTIP = "path no longer exists"
 _SIZE_FAILED_TOOLTIP = "size scan failed"
+_MODIFIED_UNKNOWN_TEXT = "-"
+
+
+def format_modified(value: datetime | None) -> str:
+    """Render a timestamp in the system locale's short format, '-' when unknown."""
+    if value is None:
+        return _MODIFIED_UNKNOWN_TEXT
+    moment = QDateTime.fromMSecsSinceEpoch(int(value.timestamp() * 1000))
+    return QLocale.system().toString(moment, QLocale.FormatType.ShortFormat)
 
 
 class PrefixTableModel(QAbstractTableModel):
@@ -75,6 +100,10 @@ class PrefixTableModel(QAbstractTableModel):
         self._rows: list[Prefix] = []
         self._openable: list[bool] = []
         self._error_provider = error_provider
+        self._highlighted_key: tuple[int, str] | None = None
+        self._highlight_timer = QTimer()
+        self._highlight_timer.setSingleShot(True)
+        self._highlight_timer.timeout.connect(self.clear_highlight)
 
     @property
     def store(self) -> Store:
@@ -135,6 +164,28 @@ class PrefixTableModel(QAbstractTableModel):
             return self._rows[row]
         return None
 
+    def highlight_row(self, prefix: Prefix) -> None:
+        """Mark one row as highlighted for a short window (no selection change)."""
+        self._highlighted_key = prefix_key(prefix)
+        self._emit_rows_changed_for(self._highlighted_key)
+        self._highlight_timer.start(HIGHLIGHT_DURATION_MS)
+
+    def clear_highlight(self) -> None:
+        key = self._highlighted_key
+        if key is None:
+            return
+        self._highlighted_key = None
+        self._emit_rows_changed_for(key)
+
+    def highlighted_key(self) -> tuple[int, str] | None:
+        return self._highlighted_key
+
+    def _emit_rows_changed_for(self, key: tuple[int, str]) -> None:
+        for row, row_prefix in enumerate(self._rows):
+            if prefix_key(row_prefix) == key:
+                self.dataChanged.emit(self.index(row, 0), self.index(row, COLUMN_COUNT - 1))
+                return
+
     def data(
         self,
         index: QModelIndex | QPersistentModelIndex,
@@ -144,6 +195,13 @@ class PrefixTableModel(QAbstractTableModel):
             return None
         prefix = self._rows[index.row()]
         column = index.column()
+        if self._highlighted_key is not None and prefix_key(prefix) == self._highlighted_key:
+            if role == Qt.ItemDataRole.BackgroundRole:
+                palette = QApplication.palette()
+                return QBrush(palette.color(QPalette.ColorRole.Highlight))
+            if role == Qt.ItemDataRole.ForegroundRole:
+                palette = QApplication.palette()
+                return QBrush(palette.color(QPalette.ColorRole.HighlightedText))
         if role == Qt.ItemDataRole.DisplayRole:
             return self._display_text(prefix, index.row(), column)
         if column == CHECK_COLUMN and role == Qt.ItemDataRole.CheckStateRole:
@@ -152,7 +210,7 @@ class PrefixTableModel(QAbstractTableModel):
             return int(state.value)
         if role == Qt.ItemDataRole.ToolTipRole:
             return self._tooltip(prefix, index.row(), column)
-        if role == Qt.ItemDataRole.TextAlignmentRole and column == SIZE_COLUMN:
+        if role == Qt.ItemDataRole.TextAlignmentRole and column in (SIZE_COLUMN, MODIFIED_COLUMN):
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         if column == OPEN_COLUMN and role == Qt.ItemDataRole.UserRole:
             return self.open_enabled(index.row())
@@ -224,6 +282,8 @@ class PrefixTableModel(QAbstractTableModel):
             if prefix.scan_status is ScanStatus.FAILED:
                 return "Unavailable"
             return format_size(prefix.size_bytes)
+        if column == MODIFIED_COLUMN:
+            return format_modified(prefix.modified)
         return ""
 
     def _tooltip(self, prefix: Prefix, row: int, column: int) -> str | None:
@@ -263,6 +323,7 @@ class PrefixTable(QTableView):
         header.setSectionResizeMode(NAME_COLUMN, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(PATH_COLUMN, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(SIZE_COLUMN, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(MODIFIED_COLUMN, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(OPEN_COLUMN, QHeaderView.ResizeMode.Fixed)
         header.setMinimumHeight(int(self.fontMetrics().height() * HEADER_HEIGHT_RATIO))
         self.setColumnWidth(CHECK_COLUMN, CHECK_WIDTH_PX)
@@ -270,6 +331,7 @@ class PrefixTable(QTableView):
         self.setColumnWidth(APP_ID_COLUMN, APP_ID_DEFAULT_PX)
         self.setColumnWidth(NAME_COLUMN, NAME_DEFAULT_PX)
         self.setColumnWidth(SIZE_COLUMN, SIZE_DEFAULT_PX)
+        self.setColumnWidth(MODIFIED_COLUMN, MODIFIED_DEFAULT_PX)
         self.setItemDelegateForColumn(OPEN_COLUMN, OpenActionDelegate(self))
         header.sectionClicked.connect(self._on_section_clicked)
         self._header_checkbox = QCheckBox(header)

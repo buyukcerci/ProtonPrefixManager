@@ -5,9 +5,20 @@ from __future__ import annotations
 import re
 
 import pytest
+from PySide6.QtGui import QColor, QPalette
 
 from core.config import AppConfig
-from ui.styles import STYLESHEET, _ensure_visible_alternate_base, apply_app_style
+from core.models import PrefixType
+from ui.styles import (
+    MUTED_TEXT_ALPHA,
+    STYLESHEET,
+    SecondaryLabel,
+    _ensure_visible_alternate_base,
+    apply_app_style,
+    cell_fill_color,
+    classification_color,
+    readable_text_color,
+)
 
 
 @pytest.fixture()
@@ -88,3 +99,116 @@ def test_alternate_base_untouched_when_already_distinct(restored_app_state) -> N
     saved_alternate = app.palette().color(QPalette.ColorRole.AlternateBase)
     _ensure_visible_alternate_base(app)
     assert app.palette().color(QPalette.ColorRole.AlternateBase) == saved_alternate
+
+
+# --- classification color derivation ----------------------------------------
+
+
+def _light_palette() -> QPalette:
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Base, QColor(255, 255, 255))
+    palette.setColor(QPalette.ColorRole.Window, QColor(239, 239, 239))
+    return palette
+
+
+def _dark_palette() -> QPalette:
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Base, QColor(30, 30, 30))
+    palette.setColor(QPalette.ColorRole.Window, QColor(45, 45, 45))
+    return palette
+
+
+def test_classification_colors_pairwise_distinct_in_both_themes() -> None:
+    for palette in (_light_palette(), _dark_palette()):
+        colors = {
+            prefix_type: classification_color(prefix_type, palette) for prefix_type in PrefixType
+        }
+        values = list(colors.values())
+        for index, first in enumerate(values):
+            for second in values[index + 1 :]:
+                assert first.rgb() != second.rgb(), "classifications must not share a color"
+        assert all(color.alpha() == 255 for color in values)
+
+
+def test_classification_colors_stay_in_their_hue_families() -> None:
+    for palette in (_light_palette(), _dark_palette()):
+        assert 190 <= classification_color(PrefixType.STEAM, palette).hslHue() <= 240
+        assert 25 <= classification_color(PrefixType.NON_STEAM, palette).hslHue() <= 60
+        orphan_hue = classification_color(PrefixType.ORPHANED, palette).hslHue()
+        assert orphan_hue <= 15 or orphan_hue >= 350 or orphan_hue == -1
+
+
+def test_classification_colors_lift_for_dark_and_deepen_for_light() -> None:
+    light = classification_color(PrefixType.STEAM, _light_palette())
+    dark = classification_color(PrefixType.STEAM, _dark_palette())
+    assert dark.lightness() > light.lightness()
+
+
+def test_cell_fill_color_varies_lightness_and_is_stable() -> None:
+    palette = _light_palette()
+    base = cell_fill_color(PrefixType.STEAM, 100, palette)
+    other = cell_fill_color(PrefixType.STEAM, 101, palette)
+    assert base.hslHue() == other.hslHue()  # classification identity preserved
+    again = cell_fill_color(PrefixType.STEAM, 100, palette)
+    assert base.rgb() == again.rgb()  # stable per app_id
+    variations = {cell_fill_color(PrefixType.STEAM, app_id, palette).rgb() for app_id in range(20)}
+    assert len(variations) > 1
+
+
+def test_readable_text_color_contrasts_with_fill() -> None:
+    def luminance(color: QColor) -> float:
+        return 0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue()
+
+    for fill in (QColor(255, 255, 255), QColor(230, 220, 200), QColor(244, 208, 63)):
+        text = readable_text_color(fill)
+        assert abs(luminance(text) - luminance(fill)) > 80
+    for fill in (QColor(0, 0, 0), QColor(38, 122, 206), QColor(206, 43, 38)):
+        text = readable_text_color(fill)
+        assert abs(luminance(text) - luminance(fill)) > 80
+
+
+# --- muted secondary text ------------------------------------------------------
+
+
+@pytest.fixture()
+def restored_app_palette(qapp):
+    """Snapshot and restore the shared application palette."""
+    saved = QPalette(qapp.palette())
+    yield qapp
+    qapp.setPalette(saved)
+
+
+def _window_text(app) -> QColor:
+    return app.palette().color(QPalette.ColorRole.WindowText)
+
+
+def test_secondary_label_mutes_window_text(qtbot, restored_app_palette) -> None:
+    label = SecondaryLabel("caption text")
+    qtbot.addWidget(label)
+    muted = label.muted_color()
+    source = _window_text(restored_app_palette)
+    assert muted.red() == source.red()
+    assert muted.green() == source.green()
+    assert muted.blue() == source.blue()
+    assert muted.alpha() == MUTED_TEXT_ALPHA
+
+
+def test_secondary_label_follows_theme_changes(qtbot, restored_app_palette) -> None:
+    app = restored_app_palette
+    label = SecondaryLabel("caption text")
+    qtbot.addWidget(label)
+
+    dark = QPalette()
+    dark.setColor(QPalette.ColorRole.Base, QColor(30, 30, 30))
+    dark.setColor(QPalette.ColorRole.WindowText, QColor(235, 235, 235))
+    app.setPalette(dark)
+
+    muted = label.muted_color()
+    assert (muted.red(), muted.green(), muted.blue()) == (235, 235, 235)
+    assert muted.alpha() == MUTED_TEXT_ALPHA
+    # the alpha blend against the dark base must stay clearly readable
+    base = app.palette().color(QPalette.ColorRole.Base)
+    blended = (muted.red() * muted.alpha() + base.red() * (255 - muted.alpha())) / 255
+    assert abs(blended - base.red()) > 60
+    pixmap = label.grab()
+    assert not pixmap.isNull()

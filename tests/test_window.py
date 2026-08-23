@@ -12,9 +12,9 @@ from PySide6.QtCore import Qt
 from core.config import load_config, save_config
 from core.deletion import DeleteMode
 from core.discovery import DiscoveryResult, Library, RootSource, SteamRoot
-from core.models import Prefix, PrefixType, ScanStatus
+from core.models import Prefix, PrefixType, ScanStatus, format_size, prefix_key
 from core.scanner import ScanEvent, ScanEventKind, save_cached
-from ui.main_window import _NO_ROWS_TEXT, MainWindow
+from ui.main_window import _NO_ROWS_TEXT, _PAGE_OVERVIEW, _PAGE_PREFIXES, MainWindow
 from ui.table import SIZE_COLUMN
 
 
@@ -260,11 +260,11 @@ def test_no_match_shows_filtered_message_page(qtbot, isolated_env: Path) -> None
     window._target_combo.setCurrentIndex(0)
     window._on_search_text_changed("zzz-does-not-exist")
     window._search_timer.timeout.emit()
-    assert window._stack.currentIndex() == 0
-    assert window._message_label.text() == _NO_ROWS_TEXT
+    assert window._inner_stack.currentIndex() == 0
+    assert window._inner_message_label.text() == _NO_ROWS_TEXT
     window._on_search_text_changed("")
     window._search_timer.timeout.emit()
-    assert window._stack.currentIndex() == 1
+    assert window._inner_stack.currentIndex() == 1
 
 
 def test_search_debounces_then_filters_by_target(qtbot, isolated_env: Path) -> None:
@@ -532,5 +532,118 @@ def test_all_filters_off_yields_empty_view(qtbot, isolated_env: Path) -> None:
     for pt in (PrefixType.STEAM, PrefixType.NON_STEAM, PrefixType.ORPHANED):
         window._on_type_toggled(pt, False)
     assert window._model.rows() == []
+    assert window._inner_stack.currentIndex() == 0
+    assert window._inner_message_label.text() == _NO_ROWS_TEXT
+
+
+# --- navigation and overview -------------------------------------------------
+
+
+def test_navigation_switches_pages(qtbot, isolated_env: Path) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    assert window._pages.currentIndex() == _PAGE_OVERVIEW
+    window._prefixes_button.setChecked(True)
+    assert window._pages.currentIndex() == _PAGE_PREFIXES
+    window._overview_button.setChecked(True)
+    assert window._pages.currentIndex() == _PAGE_OVERVIEW
+    assert window._overview_button.isChecked()
+    assert not window._prefixes_button.isChecked()
+
+
+def test_filter_and_action_bars_only_visible_on_prefixes_page(qtbot, isolated_env: Path) -> None:
+    window, _ = _filter_fixture(qtbot, isolated_env)
+    window.show()
+    qtbot.waitExposed(window)
+    window._set_page(_PAGE_OVERVIEW)
+    assert window._pages.currentIndex() == _PAGE_OVERVIEW
+    assert not window._search_box.isVisible()
+    assert not window._delete_button.isVisible()
+    window._set_page(_PAGE_PREFIXES)
+    assert window._search_box.isVisible()
+    assert window._delete_button.isVisible()
+
+
+def test_prefix_focus_handoff_resets_filters_and_highlights(qtbot, isolated_env: Path) -> None:
+    window, prefixes = _filter_fixture(qtbot, isolated_env)
+    window._set_type_filter({PrefixType.STEAM})
+    window._on_search_text_changed("zzz-no-match")
+    window._search_timer.timeout.emit()
+    assert window._model.rows() == []
+
+    target = prefixes[2]  # the orphan
+    window._on_prefix_focus_requested(target)
+
+    assert window._pages.currentIndex() == _PAGE_PREFIXES
+    assert window._filter_types == set(PrefixType)
+    assert window._config.type_filter == [
+        PrefixType.STEAM,
+        PrefixType.NON_STEAM,
+        PrefixType.ORPHANED,
+    ]
+    assert window._search_text == ""
+    assert window._search_box.text() == ""
+    assert 777 in [row.app_id for row in window._model.rows()]
+    assert window._model.highlighted_key() == prefix_key(target)
+    assert window._store.selected() == []  # highlighted, never selected
+
+
+def test_orphan_review_handoff_filters_and_selects_visible(qtbot, isolated_env: Path) -> None:
+    window, prefixes = _filter_fixture(qtbot, isolated_env)
+    window._set_type_filter(set(PrefixType))
+    window._on_orphan_review_requested()
+
+    assert window._pages.currentIndex() == _PAGE_PREFIXES
+    assert window._filter_types == {PrefixType.ORPHANED}
+    assert window._config.type_filter == [PrefixType.ORPHANED]
+    assert [row.app_id for row in window._model.rows()] == [777]
+    selected = window._store.selected()
+    assert len(selected) == 1 and selected[0].app_id == 777
+    assert window._delete_button.text() == "Delete Prefixes (1)"
+
+
+def test_overview_recomputes_from_discovery_and_scan_events(qtbot, isolated_env: Path) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    payload = _synthetic_payload(isolated_env / "ov", app_ids=(30, 31))
+    for prefix, size in zip(payload[1], (512, 256), strict=True):
+        save_cached(
+            window._config.size_cache,
+            replace(
+                prefix,
+                size_bytes=size,
+                scan_status=ScanStatus.SCANNED,
+                last_scanned=datetime.now(UTC),
+            ),
+        )
+    window._on_discovery_finished(payload, window._epoch)
+
+    assert window._disk_capacity is not None
+    assert window._overview.prefixes_card.value_text() == "2"
+    assert window._overview.prefixes_card.detail_text() == format_size(768)
+    assert window._overview.status_label.text() == "2 of 2 prefixes sized"
+
+    rescanned = replace(
+        payload[1][1],
+        size_bytes=128,
+        scan_status=ScanStatus.SCANNED,
+        last_scanned=datetime.now(UTC),
+    )
+    window._on_scan_event(
+        ScanEvent(kind=ScanEventKind.COMPLETED, prefix=rescanned, size_bytes=128),
+        window._epoch,
+    )
+    assert window._overview.prefixes_card.detail_text() == format_size(640)
+
+
+def test_overview_empty_states_share_message_page(qtbot, isolated_env: Path) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    window._set_page(_PAGE_OVERVIEW)
+    window._on_discovery_finished((DiscoveryResult(), []), window._epoch)
     assert window._stack.currentIndex() == 0
-    assert window._message_label.text() == _NO_ROWS_TEXT
+    assert "No valid Steam root" in window._message_label.text()
+    window._set_page(_PAGE_PREFIXES)
+    window._on_discovery_finished((DiscoveryResult(), []), window._epoch)
+    assert window._stack.currentIndex() == 0
+    assert "No valid Steam root" in window._message_label.text()

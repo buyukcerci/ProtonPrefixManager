@@ -2,22 +2,26 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from PySide6.QtCore import Qt
 
-from core.models import Prefix, PrefixType, ScanStatus, SelectionState, Store
+from core.models import Prefix, PrefixType, ScanStatus, SelectionState, Store, prefix_key
 from ui.styles import MIN_HEADER_SECTION_PX
 from ui.table import (
     APP_ID_COLUMN,
     CHECK_COLUMN,
+    MODIFIED_COLUMN,
     NAME_COLUMN,
     OPEN_COLUMN,
     PATH_COLUMN,
     SIZE_COLUMN,
+    SORTABLE_COLUMNS,
     PrefixTable,
     PrefixTableModel,
+    format_modified,
 )
 
 
@@ -53,9 +57,9 @@ def populated(tmp_path: Path) -> tuple[PrefixTableModel, Store, list[Prefix]]:
 
 def test_column_order_and_labels(populated) -> None:
     model, _, _ = populated
-    assert model.columnCount() == 6
-    labels = [model.headerData(c, Qt.Orientation.Horizontal) for c in range(6)]
-    assert labels == [None, "Name", "AppID", "Path", "Size", None]
+    assert model.columnCount() == 7
+    labels = [model.headerData(c, Qt.Orientation.Horizontal) for c in range(7)]
+    assert labels == [None, "Name", "AppID", "Path", "Size", "Modified", None]
     assert model.rowCount() == 2
 
 
@@ -181,7 +185,7 @@ def test_responsive_column_configuration(qtbot, populated) -> None:
     assert header.sectionResizeMode(PATH_COLUMN) is QHeaderView.ResizeMode.Stretch
     assert header.sectionResizeMode(0) is QHeaderView.ResizeMode.Fixed
     assert header.sectionResizeMode(OPEN_COLUMN) is QHeaderView.ResizeMode.Fixed
-    for column in (APP_ID_COLUMN, NAME_COLUMN, SIZE_COLUMN):
+    for column in (APP_ID_COLUMN, NAME_COLUMN, SIZE_COLUMN, MODIFIED_COLUMN):
         mode = header.sectionResizeMode(column)
         assert mode is QHeaderView.ResizeMode.Interactive
         assert (
@@ -190,6 +194,7 @@ def test_responsive_column_configuration(qtbot, populated) -> None:
                 APP_ID_COLUMN: 70,
                 NAME_COLUMN: 120,
                 SIZE_COLUMN: 90,
+                MODIFIED_COLUMN: 100,
             }[column]
         )
 
@@ -201,6 +206,49 @@ def test_alternating_row_colors_enabled(qtbot, populated) -> None:
     table = PrefixTable(model)
     qtbot.addWidget(table)
     assert table.alternatingRowColors() is True
+
+
+# --- modified column and row highlight ---------------------------------------
+
+
+def test_modified_column_formats_locale_or_placeholder(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    known = _make_prefix(tmp_path, "known", 1000, size=10)
+    known = replace(known, modified=datetime(2026, 7, 1, 10, 0, 0, tzinfo=UTC))
+    unknown = _make_prefix(tmp_path / "u", "unknown", 1001, size=10)
+    model = PrefixTableModel()
+    model.set_rows([known, unknown])
+
+    shown = model.data(model.index(0, MODIFIED_COLUMN), Qt.ItemDataRole.DisplayRole)
+    assert shown == format_modified(known.modified)
+    assert shown != "-"
+    assert model.data(model.index(1, MODIFIED_COLUMN), Qt.ItemDataRole.DisplayRole) == "-"
+    alignment = model.data(model.index(0, MODIFIED_COLUMN), Qt.ItemDataRole.TextAlignmentRole)
+    assert alignment == int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+
+def test_modified_column_is_sortable() -> None:
+    assert SORTABLE_COLUMNS[MODIFIED_COLUMN] == "modified"
+
+
+def test_highlight_row_brush_then_clear(qtbot, populated) -> None:
+    model, store, prefixes = populated
+    table = PrefixTable(model)
+    qtbot.addWidget(table)
+    model.set_rows(store.prefixes)
+    target = prefixes[0]
+    index = model.index(0, NAME_COLUMN)
+
+    model.highlight_row(target)
+    assert model.highlighted_key() == prefix_key(target)
+    assert model.data(index, Qt.ItemDataRole.BackgroundRole) is not None
+    assert model.data(index, Qt.ItemDataRole.ForegroundRole) is not None
+
+    model.clear_highlight()
+    assert model.highlighted_key() is None
+    assert model.data(index, Qt.ItemDataRole.BackgroundRole) is None
+    assert model.data(index, Qt.ItemDataRole.ForegroundRole) is None
 
 
 def test_header_checkbox_centered_in_first_section(qtbot, populated) -> None:
