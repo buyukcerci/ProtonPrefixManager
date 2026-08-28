@@ -139,9 +139,14 @@ def _ensure_visible_alternate_base(app: QApplication) -> None:
 
 
 def apply_app_style(app: QApplication, config: AppConfig) -> None:
-    """Apply the shared stylesheet and the configured font to the app."""
-    app.setStyleSheet(STYLESHEET)
-    _ensure_visible_alternate_base(app)
+    """Apply the configured font and the shared stylesheet to the app.
+
+    The font is installed before the stylesheet on purpose: stylesheet
+    polish resolves widget fonts, so the repolish triggered by
+    setStyleSheet must run under the final font. Setting the stylesheet
+    first leaves running widgets rendering the previous size until some
+    later repolish.
+    """
     system = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont)
     font = QFont(system)
     font.setFamilies([system.family(), *SYSTEM_FALLBACK_FAMILIES])
@@ -150,6 +155,8 @@ def apply_app_style(app: QApplication, config: AppConfig) -> None:
     if config.font_size > 0:
         font.setPointSize(config.font_size)
     app.setFont(font)
+    app.setStyleSheet(STYLESHEET)
+    _ensure_visible_alternate_base(app)
 
 
 class SecondaryLabel(QLabel):

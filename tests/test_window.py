@@ -7,14 +7,24 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFontDatabase
+from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QWidget
 
-from core.config import load_config, save_config
+from core.config import AppConfig, load_config, save_config
 from core.deletion import DeleteMode
 from core.discovery import DiscoveryResult, Library, RootSource, SteamRoot
 from core.models import Prefix, PrefixType, ScanStatus, format_size, prefix_key
 from core.scanner import ScanEvent, ScanEventKind, save_cached
-from ui.main_window import _NO_ROWS_TEXT, _PAGE_OVERVIEW, _PAGE_PREFIXES, MainWindow
+from ui.main_window import (
+    _NO_PREFIXES_TEXT,
+    _NO_ROWS_TEXT,
+    _PAGE_OVERVIEW,
+    _PAGE_PREFIXES,
+    MainWindow,
+)
+from ui.settings import SettingsDialog
+from ui.styles import apply_app_style
 from ui.table import SIZE_COLUMN
 
 
@@ -71,7 +81,8 @@ def test_zero_roots_switches_to_message_page(qtbot, isolated_env: Path) -> None:
     qtbot.addWidget(window)
     window._on_discovery_finished((DiscoveryResult(), []), window._epoch)
     assert window._stack.currentIndex() == 0
-    assert "No valid Steam root" in window._message_label.text()
+    assert "Couldn't locate your Steam folder" in window._message_label.text()
+    assert not window._locate_button.isHidden()
 
 
 def test_roots_with_prefixes_switch_to_table(qtbot, isolated_env: Path, tmp_path: Path) -> None:
@@ -642,8 +653,227 @@ def test_overview_empty_states_share_message_page(qtbot, isolated_env: Path) -> 
     window._set_page(_PAGE_OVERVIEW)
     window._on_discovery_finished((DiscoveryResult(), []), window._epoch)
     assert window._stack.currentIndex() == 0
-    assert "No valid Steam root" in window._message_label.text()
+    assert "Couldn't locate your Steam folder" in window._message_label.text()
     window._set_page(_PAGE_PREFIXES)
     window._on_discovery_finished((DiscoveryResult(), []), window._epoch)
     assert window._stack.currentIndex() == 0
-    assert "No valid Steam root" in window._message_label.text()
+    assert "Couldn't locate your Steam folder" in window._message_label.text()
+
+
+# --- settings and first-launch locate flow --------------------------------
+
+
+def _fake_settings_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    result: QDialog.DialogCode = QDialog.DialogCode.Accepted,
+    roots: list[str] | None = None,
+    family: str | None = None,
+    size: int = 10,
+    emit_redetect: bool = False,
+) -> list[QWidget]:
+    created: list[QWidget] = []
+
+    class FakeSettingsDialog(QWidget):
+        redetect_requested = Signal()
+
+        def __init__(
+            self,
+            parent,
+            config,
+            *,
+            discovered_roots=(),
+            libraries=(),
+            focus_add_root=False,
+        ) -> None:
+            super().__init__(parent)
+            self.config = config
+            self.kwargs = {
+                "discovered_roots": discovered_roots,
+                "libraries": libraries,
+                "focus_add_root": focus_add_root,
+            }
+            created.append(self)
+
+        def custom_roots(self) -> list[str]:
+            return list(roots) if roots is not None else list(self.config.custom_roots)
+
+        def font_family(self) -> str | None:
+            return family
+
+        def font_size(self) -> int:
+            return size
+
+        def exec(self) -> QDialog.DialogCode:
+            if emit_redetect:
+                self.redetect_requested.emit()
+            return result
+
+    monkeypatch.setattr("ui.main_window.SettingsDialog", FakeSettingsDialog)
+    return created
+
+
+def test_settings_action_exists_with_shortcut(qtbot, isolated_env: Path) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    assert window._settings_action.text() == "&Settings..."
+    assert window._settings_action.shortcut().toString() == "Ctrl+,"
+
+
+def test_accepted_settings_update_config_font_and_refresh(
+    qtbot, isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    family = QFontDatabase.families()[0]
+    created = _fake_settings_dialog(monkeypatch, roots=["/games/Steam"], family=family, size=12)
+    epoch_before = window._epoch
+    original_font = QApplication.font()
+    try:
+        window._open_settings()
+
+        assert len(created) == 1
+        assert window._config.custom_roots == ["/games/Steam"]
+        assert window._config.font_family == family
+        assert window._config.font_size == 12
+        assert load_config().custom_roots == ["/games/Steam"]
+        assert window._epoch > epoch_before
+        applied = QApplication.font()
+        assert applied.family() == family
+        assert applied.pointSize() == 12
+    finally:
+        QApplication.setFont(original_font)
+
+
+def test_redetect_signal_refreshes_and_keeps_custom_roots(
+    qtbot, isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    window._config.custom_roots = ["/kept/root"]
+    created = _fake_settings_dialog(
+        monkeypatch, result=QDialog.DialogCode.Rejected, emit_redetect=True
+    )
+    epoch_before = window._epoch
+
+    window._open_settings()
+
+    assert len(created) == 1
+    assert window._config.custom_roots == ["/kept/root"]
+    assert window._epoch > epoch_before
+
+
+def test_cancelled_settings_touch_nothing(
+    qtbot, isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    _fake_settings_dialog(monkeypatch, result=QDialog.DialogCode.Rejected)
+    epoch_before = window._epoch
+
+    window._open_settings()
+
+    assert window._config.custom_roots == []
+    assert window._config.font_family is None
+    assert window._config.font_size == 10
+    assert window._epoch == epoch_before
+
+
+def test_settings_dialog_receives_last_discovery_state(
+    qtbot, isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    payload = _synthetic_payload(isolated_env / "settings", app_ids=(900,))
+    window._on_discovery_finished(payload, window._epoch)
+    created = _fake_settings_dialog(monkeypatch)
+
+    window._open_settings()
+
+    dialog = created[0]
+    assert dialog.kwargs["discovered_roots"] == payload[0].roots
+    assert dialog.kwargs["libraries"] == window._libraries
+
+
+def test_locate_button_opens_seeded_dialog_and_persists_root(
+    qtbot, isolated_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    window.show()
+    qtbot.waitExposed(window)
+    window._on_discovery_finished((DiscoveryResult(), []), window._epoch)
+    assert window._locate_button.isVisible()
+    root_dir = tmp_path / "picked"
+    root_dir.mkdir(parents=True)
+    created = _fake_settings_dialog(monkeypatch, roots=[str(root_dir.resolve())])
+    epoch_before = window._epoch
+    original_font = QApplication.font()
+    try:
+        window._locate_button.click()
+
+        assert created[0].kwargs["focus_add_root"] is True
+        assert window._config.custom_roots == [str(root_dir.resolve())]
+        assert load_config().custom_roots == [str(root_dir.resolve())]
+        assert window._epoch > epoch_before
+    finally:
+        QApplication.setFont(original_font)
+
+
+def test_prefixes_message_hides_locate_button(qtbot, isolated_env: Path) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    payload = _synthetic_payload(isolated_env / "noprefix", app_ids=(800,))
+    result = payload[0]
+    window._on_discovery_finished((result, []), window._epoch)
+    assert window._message_label.text() == _NO_PREFIXES_TEXT
+    assert window._locate_button.isHidden()
+
+
+def test_startup_font_from_config_applied_to_app(
+    qtbot, isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    family = QFontDatabase.families()[0]
+    config_dir = isolated_env / "config" / "proton-prefix-manager"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.json").write_text(
+        f'{{"version": 1, "font_family": "{family}", "font_size": 14}}', encoding="utf-8"
+    )
+    original_font = QApplication.font()
+    try:
+        window = MainWindow(auto_start=False)
+        qtbot.addWidget(window)
+        applied = QApplication.font()
+        assert applied.family() == family
+        assert applied.pointSize() == 14
+    finally:
+        QApplication.setFont(original_font)
+
+
+def test_accepted_font_change_resolves_children_immediately(
+    qtbot, isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = QApplication.instance()
+    assert isinstance(app, QApplication)
+    original_font = QApplication.font()
+    try:
+        apply_app_style(app, AppConfig(font_size=10))
+        window = MainWindow(auto_start=False)
+        qtbot.addWidget(window)
+
+        def scripted_exec(self: SettingsDialog) -> QDialog.DialogCode:
+            self._font_size_spin.lineEdit().setText("14")
+            self._font_size_spin.interpretText()
+            buttons = self.findChild(QDialogButtonBox)
+            ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+            ok_button.click()
+            return QDialog.DialogCode.Accepted
+
+        monkeypatch.setattr("ui.main_window.SettingsDialog.exec", scripted_exec)
+
+        window._open_settings()
+
+        assert QApplication.font().pointSize() == 14
+        assert window._message_label.font().pointSize() == 14
+    finally:
+        QApplication.setFont(original_font)

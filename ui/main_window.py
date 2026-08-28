@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QComboBox,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -28,7 +29,7 @@ from PySide6.QtWidgets import (
 from core.analytics import storage_capacity
 from core.config import load_config, save_config
 from core.deletion import DeleteMode, DeletionResult, DeletionStatus
-from core.discovery import DiscoveryResult, Library
+from core.discovery import DiscoveryResult, Library, SteamRoot
 from core.models import Prefix, PrefixType, ScanStatus, Store, format_size, prefix_key
 from core.opener import OpenStatus, can_open
 from core.scanner import (
@@ -46,11 +47,13 @@ from ui.dialogs import (
     unscanned_note_for,
 )
 from ui.overview import OverviewPage
+from ui.settings import SettingsDialog
 from ui.styles import (
     MESSAGE_ICON_SIZE_PX,
     MESSAGE_LAYOUT_SPACING_PX,
     MESSAGE_PAGE_MARGIN_PX,
     SEARCH_DEBOUNCE_MS,
+    apply_app_style,
 )
 from ui.table import (
     OPEN_COLUMN,
@@ -71,8 +74,8 @@ _INNER_PAGE_MESSAGE = 0
 _INNER_PAGE_TABLE = 1
 
 _NO_ROOTS_TEXT = (
-    "No valid Steam root was found.\n"
-    "Adding a custom Steam root will arrive with the settings options."
+    "Couldn't locate your Steam folder automatically.\n"
+    "Use Locate Steam Folder below to point the app at your installation."
 )
 _NO_PREFIXES_TEXT = "Steam libraries were found, but no Proton prefixes exist yet."
 _NO_ROWS_TEXT = "No prefixes match the current view."
@@ -107,6 +110,7 @@ class MainWindow(QMainWindow):
         self._sort_key = self._config.sort_column
         self._sort_descending = not self._config.sort_ascending
         self._libraries: list[Library] = []
+        self._roots: list[SteamRoot] = []
         self._filter_types: set[PrefixType] = set(self._config.type_filter)
         self._search_text = ""
         self._search_target = "name"
@@ -119,6 +123,7 @@ class MainWindow(QMainWindow):
         self._pending_filter_reset = False
         self._pending_select_all_visible = False
         self._pending_highlight_key: tuple[int, str] | None = None
+        self._apply_window_font()
 
         self._model = PrefixTableModel(error_provider=self._scan_error_for)
         self._table = PrefixTable(self._model)
@@ -132,6 +137,8 @@ class MainWindow(QMainWindow):
         self._message_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._message_page = QWidget()
         message_page = self._message_page
+        self._locate_button = QPushButton("Locate Steam Folder...", message_page)
+        self._locate_button.clicked.connect(self._on_locate_clicked)
         message_layout = QVBoxLayout(message_page)
         message_layout.setContentsMargins(
             MESSAGE_PAGE_MARGIN_PX,
@@ -143,6 +150,7 @@ class MainWindow(QMainWindow):
         message_layout.addStretch(1)
         message_layout.addWidget(self._message_icon_label, alignment=Qt.AlignmentFlag.AlignHCenter)
         message_layout.addWidget(self._message_label)
+        message_layout.addWidget(self._locate_button, alignment=Qt.AlignmentFlag.AlignHCenter)
         message_layout.addStretch(1)
         message_palette = self._message_page.palette()
         message_palette.setColor(
@@ -195,6 +203,9 @@ class MainWindow(QMainWindow):
         prefixes_layout.addWidget(self._build_action_bar(prefixes_page))
 
         self._overview = OverviewPage()
+        # SummaryCard label fonts are captured once at construction, so
+        # live font changes leave the overview cards at their startup
+        # sizes until restart; everything else follows immediately.
         self._overview.orphan_review_requested.connect(self._on_orphan_review_requested)
         self._overview.prefix_focus_requested.connect(self._on_prefix_focus_requested)
 
@@ -443,6 +454,45 @@ class MainWindow(QMainWindow):
         quit_action = file_menu.addAction("&Quit")
         quit_action.setShortcut("Ctrl+Q")
         quit_action.triggered.connect(self.close)
+        settings_menu = QMenu("&Settings", self)
+        menu_bar.addMenu(settings_menu)
+        self._settings_action = settings_menu.addAction("&Settings...")
+        self._settings_action.setShortcut("Ctrl+,")
+        self._settings_action.triggered.connect(self._open_settings)
+
+    def _apply_window_font(self) -> None:
+        """Apply the configured font through the shared application path.
+
+        Runtime changes must match what a restart would produce, so this
+        delegates to ui.styles.apply_app_style. A window-level font loses
+        to the application-wide font established at startup, which made
+        accepted settings appear ineffective until the next launch.
+        """
+        app = QApplication.instance()
+        if isinstance(app, QApplication):
+            apply_app_style(app, self._config)
+
+    def _open_settings(self, *, focus_add_root: bool = False) -> None:
+        """Show the settings dialog and persist accepted values."""
+        dialog = SettingsDialog(
+            self,
+            self._config,
+            discovered_roots=self._roots,
+            libraries=self._libraries,
+            focus_add_root=focus_add_root,
+        )
+        dialog.redetect_requested.connect(self.refresh)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._config.custom_roots = dialog.custom_roots()
+        self._config.font_family = dialog.font_family()
+        self._config.font_size = dialog.font_size()
+        save_config(self._config)
+        self._apply_window_font()
+        self.refresh()
+
+    def _on_locate_clicked(self) -> None:
+        self._open_settings(focus_add_root=True)
 
     def refresh(self) -> None:
         """Start one full pipeline run; stale runs are dropped via the epoch."""
@@ -472,6 +522,7 @@ class MainWindow(QMainWindow):
         result, prefixes = payload
         if result.errors:
             self._status.showMessage(f"discovery: {len(result.errors)} warnings", 5000)
+        self._roots = list(result.roots)
         self._config.steam_roots = [str(root.path) for root in result.roots]
         self._libraries = list(result.libraries)
 
@@ -490,7 +541,7 @@ class MainWindow(QMainWindow):
 
         if not result.roots:
             save_config(self._config)
-            self._show_message(_NO_ROOTS_TEXT)
+            self._show_message(_NO_ROOTS_TEXT, locate=True)
             return
         if not store.prefixes:
             save_config(self._config)
@@ -667,8 +718,11 @@ class MainWindow(QMainWindow):
         )
         header.setSortIndicator(section, order)
 
-    def _show_message(self, text: str) -> None:
+    def _show_message(self, text: str, *, locate: bool = False) -> None:
         self._message_label.setText(text)
+        self._locate_button.setVisible(locate)
+        if locate:
+            self._locate_button.setFocus()
         if QApplication.instance() is not None:
             icon = QApplication.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation)
             self._message_icon_label.setPixmap(
