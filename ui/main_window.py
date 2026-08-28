@@ -8,7 +8,6 @@ from PySide6.QtCore import QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
-    QButtonGroup,
     QComboBox,
     QDialog,
     QFrame,
@@ -21,6 +20,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QStatusBar,
     QStyle,
+    QTabWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -209,15 +209,14 @@ class MainWindow(QMainWindow):
         self._overview.orphan_review_requested.connect(self._on_orphan_review_requested)
         self._overview.prefix_focus_requested.connect(self._on_prefix_focus_requested)
 
-        self._pages = QStackedWidget()
-        self._pages.addWidget(self._overview)
-        self._pages.addWidget(prefixes_page)
+        self._tabs = QTabWidget()
+        self._tabs.addTab(self._overview, "Overview")
+        self._tabs.addTab(prefixes_page, "Prefixes")
 
         content = QWidget()
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.addWidget(self._build_nav_bar(content))
-        content_layout.addWidget(self._pages)
+        content_layout.addWidget(self._tabs)
 
         self._stack = QStackedWidget()
         self._stack.addWidget(message_page)
@@ -241,32 +240,6 @@ class MainWindow(QMainWindow):
         self._apply_initial_sort_indicator()
         if auto_start:
             self.refresh()
-
-    def _build_nav_bar(self, parent: QWidget) -> QWidget:
-        bar = QWidget(parent)
-        layout = QHBoxLayout(bar)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-        self._nav_group = QButtonGroup(bar)
-        self._nav_group.setExclusive(True)
-        self._overview_button = QToolButton(bar)
-        self._overview_button.setText("Overview")
-        self._overview_button.setCheckable(True)
-        self._prefixes_button = QToolButton(bar)
-        self._prefixes_button.setText("Prefixes")
-        self._prefixes_button.setCheckable(True)
-        self._nav_group.addButton(self._overview_button, _PAGE_OVERVIEW)
-        self._nav_group.addButton(self._prefixes_button, _PAGE_PREFIXES)
-        self._overview_button.setChecked(True)
-        layout.addWidget(self._overview_button)
-        layout.addWidget(self._prefixes_button)
-        layout.addStretch(1)
-        self._nav_group.idToggled.connect(self._on_nav_toggled)
-        return bar
-
-    def _on_nav_toggled(self, identifier: int, checked: bool) -> None:
-        if checked:
-            self._pages.setCurrentIndex(identifier)
 
     def _build_filter_bar(self, parent: QWidget) -> QWidget:
         bar = QWidget(parent)
@@ -630,14 +603,8 @@ class MainWindow(QMainWindow):
         save_config(self._config)
 
     def _set_page(self, index: int) -> None:
-        self._pages.setCurrentIndex(index)
-        for button, page in (
-            (self._overview_button, _PAGE_OVERVIEW),
-            (self._prefixes_button, _PAGE_PREFIXES),
-        ):
-            button.blockSignals(True)
-            button.setChecked(page == index)
-            button.blockSignals(False)
+        """Switch between the Overview and Prefixes tabs."""
+        self._tabs.setCurrentIndex(index)
 
     def _on_prefix_focus_requested(self, prefix: object) -> None:
         if not isinstance(prefix, Prefix):

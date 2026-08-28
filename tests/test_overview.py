@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pathlib
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -332,21 +331,6 @@ def test_treemap_height_between_bounds_on_small_windows(qtbot) -> None:
     # below the cap the treemap absorbs free space but never dominates
     height = page.treemap.height()
     assert OVERVIEW_TREEMAP_MIN_HEIGHT_PX <= height < OVERVIEW_TREEMAP_MAX_HEIGHT_PX
-
-
-def test_nav_bar_spacing_is_two_pixels(qtbot, monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
-    monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
-    from PySide6.QtWidgets import QHBoxLayout
-
-    from ui.main_window import MainWindow
-
-    window = MainWindow(auto_start=False)
-    qtbot.addWidget(window)
-    bar = window._nav_group.parent()
-    layout = bar.layout()
-    assert isinstance(layout, QHBoxLayout)
-    assert layout.spacing() == 2
 
 
 def test_treemap_label_color_is_uniform_across_classifications(qtbot) -> None:

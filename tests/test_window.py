@@ -550,16 +550,23 @@ def test_all_filters_off_yields_empty_view(qtbot, isolated_env: Path) -> None:
 # --- navigation and overview -------------------------------------------------
 
 
+def test_main_window_has_settings_style_tabs(qtbot, isolated_env: Path) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    assert window._tabs.count() == 2
+    assert window._tabs.tabText(0) == "Overview"
+    assert window._tabs.tabText(1) == "Prefixes"
+    assert window._tabs.currentIndex() == _PAGE_OVERVIEW
+
+
 def test_navigation_switches_pages(qtbot, isolated_env: Path) -> None:
     window = MainWindow(auto_start=False)
     qtbot.addWidget(window)
-    assert window._pages.currentIndex() == _PAGE_OVERVIEW
-    window._prefixes_button.setChecked(True)
-    assert window._pages.currentIndex() == _PAGE_PREFIXES
-    window._overview_button.setChecked(True)
-    assert window._pages.currentIndex() == _PAGE_OVERVIEW
-    assert window._overview_button.isChecked()
-    assert not window._prefixes_button.isChecked()
+    assert window._tabs.currentIndex() == _PAGE_OVERVIEW
+    window._tabs.setCurrentIndex(_PAGE_PREFIXES)
+    assert window._tabs.currentIndex() == _PAGE_PREFIXES
+    window._tabs.setCurrentIndex(_PAGE_OVERVIEW)
+    assert window._tabs.currentIndex() == _PAGE_OVERVIEW
 
 
 def test_filter_and_action_bars_only_visible_on_prefixes_page(qtbot, isolated_env: Path) -> None:
@@ -567,7 +574,7 @@ def test_filter_and_action_bars_only_visible_on_prefixes_page(qtbot, isolated_en
     window.show()
     qtbot.waitExposed(window)
     window._set_page(_PAGE_OVERVIEW)
-    assert window._pages.currentIndex() == _PAGE_OVERVIEW
+    assert window._tabs.currentIndex() == _PAGE_OVERVIEW
     assert not window._search_box.isVisible()
     assert not window._delete_button.isVisible()
     window._set_page(_PAGE_PREFIXES)
@@ -585,7 +592,7 @@ def test_prefix_focus_handoff_resets_filters_and_highlights(qtbot, isolated_env:
     target = prefixes[2]  # the orphan
     window._on_prefix_focus_requested(target)
 
-    assert window._pages.currentIndex() == _PAGE_PREFIXES
+    assert window._tabs.currentIndex() == _PAGE_PREFIXES
     assert window._filter_types == set(PrefixType)
     assert window._config.type_filter == [
         PrefixType.STEAM,
@@ -604,7 +611,7 @@ def test_orphan_review_handoff_filters_and_selects_visible(qtbot, isolated_env: 
     window._set_type_filter(set(PrefixType))
     window._on_orphan_review_requested()
 
-    assert window._pages.currentIndex() == _PAGE_PREFIXES
+    assert window._tabs.currentIndex() == _PAGE_PREFIXES
     assert window._filter_types == {PrefixType.ORPHANED}
     assert window._config.type_filter == [PrefixType.ORPHANED]
     assert [row.app_id for row in window._model.rows()] == [777]
