@@ -9,6 +9,7 @@ demotes the affected prefix to the next fallback (or skips that one source).
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -23,6 +24,29 @@ CONFIG_DIR = "config"
 SHORTCUTS_FILE = "shortcuts.vdf"
 
 UNKNOWN_NAME_TEMPLATE = "Unknown (AppID: {app_id})"
+
+# Steam installs its own runtime and Proton tooling as pseudo-apps with real
+# manifests, so they enumerate as ordinary STEAM prefixes. The curated AppID
+# list may lag Valve; the name pattern catches releases the list is missing.
+# Pattern matches Proton 9.0 and Steam Linux Runtime 5.0, rejects
+# ProtonUp-Qt and Proton-7.0, uses word boundary plus (?!-) to avoid
+# Proton-Up false positives, case insensitive for lower case manifests.
+RUNTIME_COMPONENT_APP_IDS = frozenset({226490, 962960, 1070560, 1391110, 2805730, 3240890})
+RUNTIME_COMPONENT_NAME_PATTERN = re.compile(
+    r"^(Proton|Steam Linux Runtime|Steam Runtime)\b(?!-)", re.IGNORECASE
+)
+
+
+def is_runtime_component(app_id: int, resolved_name: str | None) -> bool:
+    """True when the AppID or resolved manifest name identifies a Steam component."""
+    if app_id in RUNTIME_COMPONENT_APP_IDS:
+        return True
+    if resolved_name is None:
+        return False
+    stripped = resolved_name.strip()
+    if not stripped:
+        return False
+    return bool(RUNTIME_COMPONENT_NAME_PATTERN.search(stripped))
 
 
 def enumerate_from_discovery(result: DiscoveryResult) -> list[Prefix]:
@@ -78,6 +102,8 @@ def _classify(
 ) -> Prefix:
     manifest_name = _manifest_name(library.path, app_id)
     shortcut_name = shortcuts.get(app_id)
+    resolved_name = manifest_name if manifest_name is not None else shortcut_name
+    runtime_component = is_runtime_component(app_id, resolved_name)
     if manifest_name is not None:
         prefix_type, name = PrefixType.STEAM, manifest_name
     elif shortcut_name is not None:
@@ -93,6 +119,7 @@ def _classify(
         library=str(library.path),
         size_bytes=0,
         scan_status=ScanStatus.NOT_SCANNED,
+        is_runtime_component=runtime_component,
     )
 
 

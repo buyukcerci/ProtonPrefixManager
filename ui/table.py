@@ -75,6 +75,10 @@ _HEADER_LABELS = {
 
 _OPEN_DISABLED_TOOLTIP = "path no longer exists"
 _SIZE_FAILED_TOOLTIP = "size scan failed"
+_RUNTIME_COMPONENT_TOOLTIP = (
+    "Created by Steam for its own runtime; safe to delete, "
+    "recreated by Steam on next launch if needed."
+)
 _MODIFIED_UNKNOWN_TEXT = "-"
 
 
@@ -139,12 +143,12 @@ class PrefixTableModel(QAbstractTableModel):
     def open_enabled(self, row: int) -> bool:
         return 0 <= row < len(self._openable) and self._openable[row]
 
-    def selection_state(self) -> SelectionState:
-        return self._store.selection_state(self._rows)
+    def selection_state(self, *, exclude_runtime: bool = False) -> SelectionState:
+        return self._store.selection_state(self._rows, exclude_runtime=exclude_runtime)
 
     def toggle_visible_selection(self) -> None:
-        if self.selection_state() is SelectionState.NONE:
-            self._store.select_visible(self._rows)
+        if self.selection_state(exclude_runtime=True) is SelectionState.NONE:
+            self._store.select_visible(self._rows, exclude_runtime=True)
         else:
             self._store.clear_selection()
         self.refresh_all_check_states()
@@ -157,7 +161,7 @@ class PrefixTableModel(QAbstractTableModel):
             self.index(0, CHECK_COLUMN),
             self.index(len(self._rows) - 1, CHECK_COLUMN),
         )
-        self.header_state_changed.emit(self.selection_state())
+        self.header_state_changed.emit(self.selection_state(exclude_runtime=True))
 
     def row_at(self, row: int) -> Prefix | None:
         if 0 <= row < len(self._rows):
@@ -246,7 +250,7 @@ class PrefixTableModel(QAbstractTableModel):
         else:
             self._store.deselect(prefix)
         self.dataChanged.emit(index, index)
-        self.header_state_changed.emit(self.selection_state())
+        self.header_state_changed.emit(self.selection_state(exclude_runtime=True))
         return True
 
     def headerData(
@@ -267,7 +271,7 @@ class PrefixTableModel(QAbstractTableModel):
 
     def _display_text(self, prefix: Prefix, row: int, column: int) -> str:
         if column == NAME_COLUMN:
-            return prefix.name
+            return prefix.display_label
         if column == APP_ID_COLUMN:
             return str(prefix.app_id)
         if column == PATH_COLUMN:
@@ -287,6 +291,8 @@ class PrefixTableModel(QAbstractTableModel):
         return ""
 
     def _tooltip(self, prefix: Prefix, row: int, column: int) -> str | None:
+        if column == NAME_COLUMN and prefix.is_runtime_component:
+            return _RUNTIME_COMPONENT_TOOLTIP
         if column == PATH_COLUMN:
             return str(prefix.path)
         if column == OPEN_COLUMN and not self.open_enabled(row):

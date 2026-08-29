@@ -66,7 +66,8 @@ def format_percent(value_bytes: int, basis_bytes: int) -> str:
 
 
 def display_name(prefix: Prefix) -> str:
-    return prefix.name or f"Unknown (AppID: {prefix.app_id})"
+    label = prefix.display_label.strip() if prefix.display_label else ""
+    return label or f"Unknown (AppID: {prefix.app_id})"
 
 
 class ClassificationSwatch(QWidget):

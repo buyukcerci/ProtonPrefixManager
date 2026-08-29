@@ -239,14 +239,68 @@ def test_event_sequence_completed(tmp_path: Path) -> None:
 
 def test_cache_hit_completes_without_walk(tmp_path: Path) -> None:
     prefix = _make_prefix(tmp_path)
+    _write_file(prefix.path / "seed.bin", 11)
     cache: dict[str, dict] = {}
     first = list(scan_prefixes([prefix], cache))
-    assert first[-1].kind is ScanEventKind.COMPLETED
+    assert isinstance(first[-1].prefix, Prefix)
+    assert first[-1].prefix.size_bytes == 11
     _write_file(prefix.path / "extra.bin", 777)
     second = list(scan_prefixes([prefix], cache))
     assert second[-1].kind is ScanEventKind.COMPLETED
     assert isinstance(second[-1].prefix, Prefix)
-    assert second[-1].prefix.size_bytes == 0
+    # a nonzero entry is trusted: no walk happens, so the extra file is unseen
+    assert second[-1].prefix.size_bytes == 11
+
+
+def test_load_cached_rejects_zero_size_entries(tmp_path: Path) -> None:
+    prefix = _make_prefix(tmp_path)
+    cache: dict[str, dict] = {}
+    save_cached(cache, _scanned_copy(prefix, 0))
+    entry = cache[cache_key(prefix)]
+    assert entry["size_bytes"] == 0
+    assert load_cached(cache, prefix) is None
+
+
+def test_refresh_needed_true_for_zero_entry_false_for_nonzero(tmp_path: Path) -> None:
+    prefix = _make_prefix(tmp_path)
+    cache: dict[str, dict] = {}
+    save_cached(cache, _scanned_copy(prefix, 0))
+    assert refresh_needed(cache, prefix) is True
+    save_cached(cache, _scanned_copy(prefix, 12))
+    assert refresh_needed(cache, prefix) is False
+
+
+def test_timeline_skeleton_prefix_heals_after_population(tmp_path: Path) -> None:
+    """A prefix cached while still an empty skeleton reports real bytes later.
+
+    Mirrors the field report: a fresh prefix holds only tiny metadata files,
+    gets cached as zero, then real files appear; the next pass must re-walk
+    without any force flag and overwrite the stale zero.
+    """
+    prefix = _make_prefix(tmp_path, name="40800", app_id=40800)
+    (prefix.path / "pfx.lock").write_bytes(b"")
+    cache: dict[str, dict] = {}
+
+    first = list(scan_prefixes([prefix], cache))
+    assert isinstance(first[-1].prefix, Prefix)
+    assert first[-1].prefix.size_bytes == 0
+
+    _write_file(prefix.path / "config_info", 973)
+    _write_file(prefix.path / "tracked_files", 81_983)
+    _write_file(prefix.path / "version", 8)
+
+    second = list(scan_prefixes([prefix], cache))
+    assert second[-1].kind is ScanEventKind.COMPLETED
+    assert isinstance(second[-1].prefix, Prefix)
+    expected = 973 + 81_983 + 8
+    assert second[-1].prefix.size_bytes == expected
+    entry = CacheEntry.from_dict(cache[cache_key(prefix)])
+    assert entry is not None
+    assert entry.size_bytes == expected
+
+    third = list(scan_prefixes([prefix], cache))
+    assert isinstance(third[-1].prefix, Prefix)
+    assert third[-1].prefix.size_bytes == expected
 
 
 def test_force_refresh_rescans_despite_cache(tmp_path: Path) -> None:

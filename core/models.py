@@ -55,11 +55,19 @@ class Prefix:
     scan_status: ScanStatus = ScanStatus.NOT_SCANNED
     last_scanned: datetime | None = None
     modified: datetime | None = None
+    is_runtime_component: bool = False
 
     @property
     def is_orphan(self) -> bool:
         """Orphan status is represented by the Orphaned classification."""
         return self.prefix_type is PrefixType.ORPHANED
+
+    @property
+    def display_label(self) -> str:
+        """Name with the runtime-component tag appended when applicable."""
+        if self.is_runtime_component and self.name.strip():
+            return f"{self.name} (Steam component)"
+        return self.name
 
 
 def format_size(size_bytes: int) -> str:
@@ -123,12 +131,16 @@ class Store:
                 if search_target == "app_id":
                     if text not in str(prefix.app_id):
                         continue
-                elif text not in prefix.name.casefold():
-                    continue
+                else:
+                    name_cf = prefix.name.casefold()
+                    label_cf = prefix.display_label.casefold()
+                    if text not in name_cf and text not in label_cf:
+                        continue
             result.append(prefix)
         return result
 
     def sort(self, key: str = "size", descending: bool = True) -> None:
+        # Sorting uses name, not display_label, so runtime suffix does not affect order.
         if key == "size":
             self._prefixes.sort(key=lambda p: p.size_bytes, reverse=descending)
         elif key == "app_id":
@@ -168,8 +180,12 @@ class Store:
     def deselect(self, prefix: Prefix) -> None:
         self._selected.discard(_dedupe_key(prefix))
 
-    def select_visible(self, prefixes: Iterable[Prefix]) -> None:
+    def select_visible(
+        self, prefixes: Iterable[Prefix], *, exclude_runtime: bool = False
+    ) -> None:
         for prefix in prefixes:
+            if exclude_runtime and prefix.is_runtime_component:
+                continue
             self._selected.add(_dedupe_key(prefix))
 
     def clear_selection(self) -> None:
@@ -181,8 +197,15 @@ class Store:
     def selected(self) -> list[Prefix]:
         return [prefix for prefix in self._prefixes if self.is_selected(prefix)]
 
-    def selection_state(self, visible: Iterable[Prefix] | None = None) -> SelectionState:
+    def selection_state(
+        self,
+        visible: Iterable[Prefix] | None = None,
+        *,
+        exclude_runtime: bool = False,
+    ) -> SelectionState:
         rows = list(visible) if visible is not None else self._prefixes
+        if exclude_runtime:
+            rows = [p for p in rows if not p.is_runtime_component]
         if not rows:
             return SelectionState.NONE
         selected_count = sum(1 for prefix in rows if self.is_selected(prefix))

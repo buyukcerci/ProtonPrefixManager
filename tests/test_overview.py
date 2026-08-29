@@ -342,3 +342,20 @@ def test_treemap_label_color_is_uniform_across_classifications(qtbot) -> None:
     color = _treemap_label_color(palette)
     # one color for the whole treemap regardless of classification hue
     assert color in (Qt.GlobalColor.black, Qt.GlobalColor.white) or color.isValid()
+
+
+def test_display_name_tags_runtime_components() -> None:
+    from dataclasses import replace
+
+    from ui.overview import display_name
+
+    game = Prefix(
+        app_id=4000,
+        name="Alice",
+        prefix_type=PrefixType.STEAM,
+        path=Path("/games/steamapps/compatdata/4000"),
+        library="/games",
+    )
+    runtime = replace(game, app_id=962960, name="Proton 9.0", is_runtime_component=True)
+    assert display_name(game) == "Alice"
+    assert display_name(runtime) == "Proton 9.0 (Steam component)"

@@ -620,6 +620,48 @@ def test_orphan_review_handoff_filters_and_selects_visible(qtbot, isolated_env: 
     assert window._delete_button.text() == "Delete Prefixes (1)"
 
 
+def test_orphan_review_auto_select_skips_runtime_components(qtbot, isolated_env: Path) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    base = isolated_env / "runtime"
+    root = base / "Steam"
+    compatdata = root / "steamapps" / "compatdata"
+    orphan_dir = compatdata / "777"
+    runtime_dir = compatdata / "962960"
+    orphan_dir.mkdir(parents=True)
+    runtime_dir.mkdir(parents=True)
+    library = Library(path=root.resolve(), root=base.resolve())
+    result = DiscoveryResult(
+        roots=[SteamRoot(path=root.resolve(), source=RootSource.NATIVE)],
+        libraries=[library],
+    )
+    orphan = Prefix(
+        app_id=777,
+        name="Unknown (AppID: 777)",
+        prefix_type=PrefixType.ORPHANED,
+        path=orphan_dir,
+        library=str(root),
+    )
+    runtime = Prefix(
+        app_id=962960,
+        name="Unknown (AppID: 962960)",
+        prefix_type=PrefixType.ORPHANED,
+        path=runtime_dir,
+        library=str(root),
+        is_runtime_component=True,
+    )
+    window._on_discovery_finished((result, [orphan, runtime]), window._epoch)
+
+    window._on_orphan_review_requested()
+
+    assert window._tabs.currentIndex() == _PAGE_PREFIXES
+    assert window._filter_types == {PrefixType.ORPHANED}
+    assert sorted(row.app_id for row in window._model.rows()) == [777, 962960]
+    selected = window._store.selected()
+    assert [prefix.app_id for prefix in selected] == [777]
+    assert window._delete_button.text() == "Delete Prefixes (1)"
+
+
 def test_overview_recomputes_from_discovery_and_scan_events(qtbot, isolated_env: Path) -> None:
     window = MainWindow(auto_start=False)
     qtbot.addWidget(window)

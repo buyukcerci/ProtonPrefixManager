@@ -115,11 +115,25 @@ def cache_key(target: Prefix | Path) -> str:
     return str(path.resolve(strict=False)).rstrip("/")
 
 
+def _is_usable_entry(entry: CacheEntry | None) -> bool:
+    """True when the cached entry is present and holds a nonzero size.
+
+    Zero entries are distrusted because they may predate population.
+    """
+    return entry is not None and entry.size_bytes != 0
+
+
 def load_cached(cache: dict[str, dict], prefix: Prefix) -> Prefix | None:
-    """Return a scanned copy of prefix when a valid cache entry exists."""
+    """Return a scanned copy of prefix when a valid nonzero cache entry exists.
+
+    Entries with size_bytes == 0 are treated as misses: a zero may have
+    been captured before the prefix was populated, and replaying it would
+    pin the stale total forever.
+    """
     entry = CacheEntry.from_dict(cache.get(cache_key(prefix)))
-    if entry is None:
+    if not _is_usable_entry(entry):
         return None
+    assert entry is not None  # narrowed by _is_usable_entry
     return replace(
         prefix,
         size_bytes=entry.size_bytes,
@@ -151,10 +165,17 @@ def invalidate(cache: dict[str, dict], target: Prefix | Path) -> None:
 
 
 def refresh_needed(cache: dict[str, dict], prefix: Prefix, force: bool = False) -> bool:
-    """True when force is set or no valid cache entry exists for prefix."""
+    """True when force is set, the entry is missing, or the cached size is zero.
+
+    Zero entries are deliberately distrusted because they may predate
+    population. Legitimately empty prefixes are therefore re-walked every
+    launch until they contain bytes; the cost is one cheap scandir and
+    correctness wins.
+    """
     if force:
         return True
-    return CacheEntry.from_dict(cache.get(cache_key(prefix))) is None
+    entry = CacheEntry.from_dict(cache.get(cache_key(prefix)))
+    return not _is_usable_entry(entry)
 
 
 def scan_prefix(path: Path) -> ScanResult:
@@ -249,7 +270,10 @@ def _scan_one(
         modified=result.modified,
     )
     if cache is not None:
-        save_cached(cache, scanned)
+        if scanned.size_bytes != 0:
+            save_cached(cache, scanned)
+        else:
+            invalidate(cache, scanned)
     yield ScanEvent(kind=ScanEventKind.COMPLETED, prefix=scanned, size_bytes=scanned.size_bytes)
 
 

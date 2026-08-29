@@ -267,3 +267,38 @@ def test_header_checkbox_centered_in_first_section(qtbot, populated) -> None:
 
     assert abs(checkbox_center.x() - section_center_x) <= 2
     assert abs(checkbox_center.y() - header.height() // 2) <= 2
+
+
+def test_runtime_component_name_shows_suffix_and_tooltip(tmp_path: Path, qtbot) -> None:
+    runtime = _make_prefix(tmp_path, "runtime", 962960)
+    runtime = replace(runtime, name="Proton 9.0", is_runtime_component=True)
+    store = Store()
+    store.merge([runtime])
+    model = PrefixTableModel()
+    model.set_store(store)
+    table = PrefixTable(model)
+    qtbot.addWidget(table)
+
+    assert model.index(0, NAME_COLUMN).data() == "Proton 9.0 (Steam component)"
+    tooltip = model._tooltip(runtime, 0, NAME_COLUMN)
+    assert tooltip is not None
+    assert "safe to delete" in tooltip
+
+    plain = _make_prefix(tmp_path / "other", "plain", 4000)
+    assert model._tooltip(plain, 0, NAME_COLUMN) is None
+
+
+def test_header_shows_all_when_runtime_excluded(tmp_path: Path) -> None:
+    runtime = _make_prefix(tmp_path, "runtime", 962960)
+    runtime = replace(runtime, name="Proton 9.0", is_runtime_component=True)
+    game = _make_prefix(tmp_path / "g", "game", 4000)
+    store = Store()
+    store.merge([runtime, game])
+    model = PrefixTableModel()
+    model.set_store(store)
+    assert model.selection_state(exclude_runtime=True) is SelectionState.NONE
+    store.select_visible(model.rows(), exclude_runtime=True)
+    assert model.selection_state(exclude_runtime=True) is SelectionState.ALL
+    assert model.selection_state(exclude_runtime=False) is SelectionState.SOME
+    store.clear_selection()
+    assert model.selection_state(exclude_runtime=True) is SelectionState.NONE

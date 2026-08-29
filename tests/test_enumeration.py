@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from core.discovery import DiscoveryResult, Library, RootSource, SteamRoot
-from core.enumeration import enumerate_from_discovery, enumerate_prefixes
+from core.enumeration import enumerate_from_discovery, enumerate_prefixes, is_runtime_component
 from core.models import PrefixType
 from tests.test_vdf_binary import build_shortcuts_vdf
 
@@ -47,6 +47,57 @@ def test_steam_game_classified_with_manifest_name(tmp_path: Path) -> None:
     assert len(prefixes) == 1
     assert prefixes[0].prefix_type is PrefixType.STEAM
     assert prefixes[0].name == "Half-Life 2"
+
+
+def test_known_runtime_appid_flagged_as_component(tmp_path: Path) -> None:
+    lib = _make_library(tmp_path, app_ids=(962960,), manifests={962960: "Steam Linux Runtime 3.0"})
+    prefixes = enumerate_prefixes([lib])
+    assert len(prefixes) == 1
+    assert prefixes[0].prefix_type is PrefixType.STEAM
+    assert prefixes[0].is_runtime_component is True
+
+
+def test_proton_manifest_name_flagged_even_with_unknown_id(tmp_path: Path) -> None:
+    lib = _make_library(tmp_path, app_ids=(3240890,), manifests={3240890: "Proton 9.0"})
+    prefixes = enumerate_prefixes([lib])
+    assert len(prefixes) == 1
+    assert prefixes[0].name == "Proton 9.0"
+    assert prefixes[0].is_runtime_component is True
+
+
+def test_regular_games_are_never_flagged_as_components(tmp_path: Path) -> None:
+    lib = _make_library(tmp_path, app_ids=(4000,), manifests={4000: "Alice"})
+    prefixes = enumerate_prefixes([lib])
+    assert len(prefixes) == 1
+    assert prefixes[0].is_runtime_component is False
+
+
+def test_runtime_regex_catches_unknown_slr_release(tmp_path: Path) -> None:
+    lib = _make_library(
+        tmp_path, app_ids=(999999999,), manifests={999999999: "Steam Linux Runtime 5.0"}
+    )
+    prefixes = enumerate_prefixes([lib])
+    assert len(prefixes) == 1
+    assert prefixes[0].is_runtime_component is True
+
+
+def test_proton_prefixed_game_names_are_not_flagged() -> None:
+    assert is_runtime_component(4000, "ProtonUp-Qt") is False
+    assert is_runtime_component(4000, "Project Warlock") is False
+
+
+def test_runtime_component_lowercase_is_flagged() -> None:
+    assert is_runtime_component(4000, "proton 9.0") is True
+    assert is_runtime_component(4000, "steam linux runtime 3.0") is True
+    assert is_runtime_component(4000, "Proton-7.0") is False
+
+
+def test_orphaned_known_runtime_id_still_flagged(tmp_path: Path) -> None:
+    lib = _make_library(tmp_path, app_ids=(962960,))
+    prefixes = enumerate_prefixes([lib])
+    assert len(prefixes) == 1
+    assert prefixes[0].prefix_type is PrefixType.ORPHANED
+    assert prefixes[0].is_runtime_component is True
 
 
 def test_non_steam_classified_with_shortcut_name(tmp_path: Path) -> None:

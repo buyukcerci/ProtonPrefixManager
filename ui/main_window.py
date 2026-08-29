@@ -346,7 +346,7 @@ class MainWindow(QMainWindow):
             search_target=self._search_target,
         )
         self._model.set_rows(visible, rescan_openable=rescan_openable)
-        self._table.set_header_state(self._model.selection_state())
+        self._table.set_header_state(self._model.selection_state(exclude_runtime=True))
         if visible:
             self._inner_stack.setCurrentIndex(_INNER_PAGE_TABLE)
             self._stack.setCurrentIndex(_PAGE_CONTENT)
@@ -587,7 +587,7 @@ class MainWindow(QMainWindow):
 
     def _on_header_toggle(self) -> None:
         self._model.toggle_visible_selection()
-        self._table.set_header_state(self._model.selection_state())
+        self._table.set_header_state(self._model.selection_state(exclude_runtime=True))
 
     def _set_type_filter(self, types: set[PrefixType]) -> None:
         """Replace the active type filter, syncing menu checks and config."""
@@ -637,9 +637,12 @@ class MainWindow(QMainWindow):
         if self._pending_select_all_visible:
             self._pending_select_all_visible = False
             self._apply_filters()
-            self._store.select_visible(self._model.rows())
+            # Runtime components stay visible but are never auto-selected;
+            # mass-deleting them from orphan review would remove Steam's
+            # own tooling by accident.
+            self._store.select_visible(self._model.rows(), exclude_runtime=True)
             self._model.refresh_all_check_states()
-            self._table.set_header_state(self._model.selection_state())
+            self._table.set_header_state(self._model.selection_state(exclude_runtime=True))
         key = self._pending_highlight_key
         if key is not None:
             self._pending_highlight_key = None

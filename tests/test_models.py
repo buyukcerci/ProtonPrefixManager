@@ -213,6 +213,29 @@ def test_store_filter_combines_type_and_search() -> None:
     assert [p.app_id for p in result] == [1]
 
 
+def test_store_filter_finds_runtime_via_display_label() -> None:
+    from dataclasses import replace
+
+    runtime = replace(_prefix(app_id=962960, name="Proton 9.0"), is_runtime_component=True)
+    regular = _prefix(app_id=4000, name="Alice")
+    store = Store()
+    store.merge([runtime, regular])
+    result = store.filter(search_text="Steam component")
+    assert [p.app_id for p in result] == [962960]
+    assert store.filter(search_text="alice") == [regular]
+
+
+def test_display_label_empty_name_does_not_produce_suffix() -> None:
+    from dataclasses import replace
+
+    empty_runtime = replace(_prefix(app_id=999, name=""), is_runtime_component=True)
+    assert empty_runtime.display_label == ""
+    from ui.overview import display_name
+
+    assert display_name(empty_runtime) == "Unknown (AppID: 999)"
+    assert display_name(replace(empty_runtime, name="   ")) == "Unknown (AppID: 999)"
+
+
 def test_store_upsert_replaces_same_key() -> None:
     store = Store()
     store.upsert(_prefix(app_id=1, size_bytes=0))
