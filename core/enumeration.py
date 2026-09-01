@@ -36,6 +36,11 @@ RUNTIME_COMPONENT_NAME_PATTERN = re.compile(
     r"^(Proton|Steam Linux Runtime|Steam Runtime)\b(?!-)", re.IGNORECASE
 )
 
+# AppID 0 is Steam's internal probe prefix for shader pre-cache and
+# D3D driver query; it is not a real game and is recreated on launch,
+# so it is always ignored.
+IGNORED_APP_IDS = frozenset({0})
+
 
 def is_runtime_component(app_id: int, resolved_name: str | None) -> bool:
     """True when the AppID or resolved manifest name identifies a Steam component."""
@@ -60,7 +65,8 @@ def enumerate_prefixes(
     *,
     shortcuts_map: Mapping[int, str] | None = None,
 ) -> list[Prefix]:
-    """Enumerate prefixes under each library's compatdata in discovery order.
+    """Enumerate prefixes under each library's compatdata in discovery order,
+    skipping AppID 0 which is Steam's internal probe prefix.
 
     Names resolve manifest first, then shortcut entries from every root's
     userdata directories, then the Unknown fallback. Results dedupe on
@@ -85,6 +91,9 @@ def enumerate_prefixes(
             if not entry.name.isdigit():
                 continue
             app_id = int(entry.name)
+            # Skip ignored probe prefixes (see IGNORED_APP_IDS).
+            if app_id in IGNORED_APP_IDS:
+                continue
             path = entry.resolve(strict=False)
             key = (app_id, str(path).rstrip("/"))
             if key in seen:

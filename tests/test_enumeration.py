@@ -268,3 +268,40 @@ def test_enumerate_from_discovery_wires_result(tmp_path: Path) -> None:
     prefixes = enumerate_from_discovery(result)
     assert len(prefixes) == 1
     assert prefixes[0].name == "Wired"
+
+
+def test_appid_zero_is_ignored(tmp_path: Path) -> None:
+    lib = _make_library(tmp_path, app_ids=(0,))
+    assert enumerate_prefixes([lib]) == []
+
+
+def test_appid_zero_ignored_alongside_valid(tmp_path: Path) -> None:
+    lib = _make_library(tmp_path, app_ids=(0, 480), manifests={480: "Half-Life 2"})
+    prefixes = enumerate_prefixes([lib])
+    assert len(prefixes) == 1
+    assert prefixes[0].app_id == 480
+    assert all(prefix.app_id != 0 for prefix in prefixes)
+
+
+def test_leading_zero_zero_is_ignored(tmp_path: Path) -> None:
+    lib = _make_library(tmp_path)
+    compatdata = lib.path / "steamapps" / "compatdata"
+    (compatdata / "00").mkdir()
+    (compatdata / "007").mkdir()
+    (compatdata / "0").mkdir()
+    prefixes = enumerate_prefixes([lib])
+    app_ids = [prefix.app_id for prefix in prefixes]
+    assert len(prefixes) == 1
+    assert 0 not in app_ids
+    assert 7 in app_ids
+
+
+def test_appid_zero_ignored_across_libraries(tmp_path: Path) -> None:
+    lib_a = _make_library(tmp_path / "a", name="LibA", app_ids=(0, 480), manifests={480: "Game A"})
+    lib_b = _make_library(tmp_path / "b", name="LibB", app_ids=(999,))
+    prefixes = enumerate_prefixes([lib_a, lib_b])
+    app_ids = [prefix.app_id for prefix in prefixes]
+    assert 0 not in app_ids
+    assert 480 in app_ids
+    assert 999 in app_ids
+    assert len(prefixes) == 2
