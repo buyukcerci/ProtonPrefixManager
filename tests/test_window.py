@@ -155,6 +155,31 @@ def test_refresh_epoch_drops_stale_events(qtbot, isolated_env: Path) -> None:
     assert window._model.rows()[0].size_bytes == 128
 
 
+def test_warning_count_restored_after_scan(qtbot, isolated_env: Path) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    result, prefixes = _synthetic_payload(isolated_env, app_ids=(700,))
+    config_path = result.roots[0].path / "config" / "config.vdf"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_bytes(b"\xff\xfe broken")
+    window._on_discovery_finished((result, prefixes), window._epoch)
+    assert window._warning_count == 1
+    assert window._status.currentMessage().startswith("Scanning sizes")
+    window._on_scan_finished(window._epoch)
+    assert window._status.currentMessage() == "warnings: 1"
+
+
+def test_clean_scan_finishes_with_empty_status(qtbot, isolated_env: Path) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    result, prefixes = _synthetic_payload(isolated_env, app_ids=(701,))
+    window._on_discovery_finished((result, prefixes), window._epoch)
+    assert window._warning_count == 0
+    assert window._status.currentMessage().startswith("Scanning sizes")
+    window._on_scan_finished(window._epoch)
+    assert window._status.currentMessage() == ""
+
+
 def test_default_config_sorts_size_descending(qtbot, isolated_env: Path) -> None:
     window = MainWindow(auto_start=False)
     qtbot.addWidget(window)

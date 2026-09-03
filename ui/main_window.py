@@ -40,6 +40,7 @@ from core.scanner import (
     load_cached,
     refresh_needed,
 )
+from core.toolmap import ToolMapError, load_tool_mapping, tool_name_for
 from ui.dialogs import (
     confirm_final,
     confirm_selection,
@@ -111,6 +112,9 @@ class MainWindow(QMainWindow):
         self._sort_descending = not self._config.sort_ascending
         self._libraries: list[Library] = []
         self._roots: list[SteamRoot] = []
+        self._tool_mapping: dict[int, str] = {}
+        self._tool_errors: list[ToolMapError] = []
+        self._warning_count: int = 0
         self._filter_types: set[PrefixType] = set(self._config.type_filter)
         self._search_text = ""
         self._search_target = "name"
@@ -125,7 +129,9 @@ class MainWindow(QMainWindow):
         self._pending_highlight_key: tuple[int, str] | None = None
         self._apply_window_font()
 
-        self._model = PrefixTableModel(error_provider=self._scan_error_for)
+        self._model = PrefixTableModel(
+            error_provider=self._scan_error_for, tool_provider=self._tool_for
+        )
         self._table = PrefixTable(self._model)
         self._store = self._model.store
 
@@ -493,11 +499,15 @@ class MainWindow(QMainWindow):
         if epoch != self._epoch:
             return
         result, prefixes = payload
-        if result.errors:
-            self._status.showMessage(f"discovery: {len(result.errors)} warnings", 5000)
         self._roots = list(result.roots)
         self._config.steam_roots = [str(root.path) for root in result.roots]
         self._libraries = list(result.libraries)
+        self._tool_mapping, self._tool_errors = load_tool_mapping(self._roots)
+        self._model.set_tool_provider(self._tool_for)
+        warning_count = len(result.errors) + len(self._tool_errors)
+        self._warning_count = warning_count
+        if warning_count:
+            self._status.showMessage(f"warnings: {warning_count}", 5000)
 
         store = Store()
         store.merge(prefixes)
@@ -568,6 +578,8 @@ class MainWindow(QMainWindow):
             return
         if self._status.currentMessage().startswith("Scanning sizes"):
             self._status.clearMessage()
+        if self._warning_count:
+            self._status.showMessage(f"warnings: {self._warning_count}", 5000)
         save_config(self._config)
 
     def _on_sort_column_clicked(self, section: int) -> None:
@@ -715,6 +727,10 @@ class MainWindow(QMainWindow):
 
     def _scan_error_for(self, prefix: Prefix) -> str | None:
         return self._scan_errors.get(cache_key(prefix))
+
+    def _tool_for(self, prefix: Prefix) -> str | None:
+        tool = tool_name_for(self._tool_mapping, prefix.app_id)
+        return tool or None
 
     def closeEvent(self, event) -> None:
         QThreadPool.globalInstance().waitForDone(_SCAN_WAIT_MS)

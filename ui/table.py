@@ -98,12 +98,14 @@ class PrefixTableModel(QAbstractTableModel):
     def __init__(
         self,
         error_provider: Callable[[Prefix], str | None] | None = None,
+        tool_provider: Callable[[Prefix], str | None] | None = None,
     ) -> None:
         super().__init__()
         self._store = Store()
         self._rows: list[Prefix] = []
         self._openable: list[bool] = []
         self._error_provider = error_provider
+        self._tool_provider = tool_provider
         self._highlighted_key: tuple[int, str] | None = None
         self._highlight_timer = QTimer()
         self._highlight_timer.setSingleShot(True)
@@ -131,6 +133,15 @@ class PrefixTableModel(QAbstractTableModel):
         if rescan_openable or len(self._openable) != len(self._rows):
             self._openable = [prefix.path.is_dir() for prefix in self._rows]
         self.endResetModel()
+
+    def set_tool_provider(self, provider: Callable[[Prefix], str | None] | None) -> None:
+        """Replace the tool lookup and refresh name column tooltips."""
+        self._tool_provider = provider
+        if self._rows:
+            self.dataChanged.emit(
+                self.index(0, NAME_COLUMN),
+                self.index(len(self._rows) - 1, NAME_COLUMN),
+            )
 
     def rows(self) -> list[Prefix]:
         return list(self._rows)
@@ -291,8 +302,17 @@ class PrefixTableModel(QAbstractTableModel):
         return ""
 
     def _tooltip(self, prefix: Prefix, row: int, column: int) -> str | None:
-        if column == NAME_COLUMN and prefix.is_runtime_component:
-            return _RUNTIME_COMPONENT_TOOLTIP
+        if column == NAME_COLUMN:
+            parts: list[str] = []
+            if self._tool_provider is not None:
+                tool = self._tool_provider(prefix)
+                if tool and tool.strip():
+                    parts.append(f"Proton tool: {tool.strip()}")
+            if prefix.is_runtime_component:
+                parts.append(_RUNTIME_COMPONENT_TOOLTIP)
+            if parts:
+                return ". ".join(parts)
+            return None
         if column == PATH_COLUMN:
             return str(prefix.path)
         if column == OPEN_COLUMN and not self.open_enabled(row):
