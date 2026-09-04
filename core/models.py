@@ -180,9 +180,7 @@ class Store:
     def deselect(self, prefix: Prefix) -> None:
         self._selected.discard(_dedupe_key(prefix))
 
-    def select_visible(
-        self, prefixes: Iterable[Prefix], *, exclude_runtime: bool = False
-    ) -> None:
+    def select_visible(self, prefixes: Iterable[Prefix], *, exclude_runtime: bool = False) -> None:
         for prefix in prefixes:
             if exclude_runtime and prefix.is_runtime_component:
                 continue

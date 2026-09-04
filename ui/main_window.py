@@ -2,16 +2,28 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import replace
 
-from PySide6.QtCore import QRunnable, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtCore import (
+    QAbstractTableModel,
+    QModelIndex,
+    QPersistentModelIndex,
+    QRunnable,
+    Qt,
+    QThreadPool,
+    QTimer,
+    Signal,
+)
+from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -20,6 +32,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QStatusBar,
     QStyle,
+    QTableView,
     QTabWidget,
     QToolButton,
     QVBoxLayout,
@@ -28,7 +41,12 @@ from PySide6.QtWidgets import (
 
 from core.analytics import storage_capacity
 from core.config import load_config, save_config
-from core.deletion import DeleteMode, DeletionResult, DeletionStatus
+from core.deletion import (
+    DeleteMode,
+    DeletionResult,
+    DeletionStatus,
+    ToolDeletionResult,
+)
 from core.discovery import DiscoveryResult, Library, SteamRoot
 from core.models import Prefix, PrefixType, ScanStatus, Store, format_size, prefix_key
 from core.opener import OpenStatus, can_open
@@ -41,15 +59,18 @@ from core.scanner import (
     refresh_needed,
 )
 from core.toolmap import ToolMapError, load_tool_mapping, tool_name_for
+from core.tools import SYSTEM_TOOLS_DIR, Tool, enumerate_tools, used_by
 from ui.dialogs import (
     confirm_final,
     confirm_selection,
     show_deletion_summary,
+    tools_pending_note_for,
     unscanned_note_for,
 )
 from ui.overview import OverviewPage
 from ui.settings import SettingsDialog
 from ui.styles import (
+    CHECK_WIDTH_PX,
     MESSAGE_ICON_SIZE_PX,
     MESSAGE_LAYOUT_SPACING_PX,
     MESSAGE_PAGE_MARGIN_PX,
@@ -62,14 +83,23 @@ from ui.table import (
     SORTABLE_COLUMNS,
     PrefixTable,
     PrefixTableModel,
+    shared_view_settings,
 )
-from ui.workers import DeletionWorker, DiscoveryWorker, OpenFolderWorker, ScanWorker
+from ui.workers import (
+    DeletionWorker,
+    DiscoveryWorker,
+    OpenFolderWorker,
+    ScanWorker,
+    ToolDeletionWorker,
+    ToolSizeWorker,
+)
 
 _PAGE_MESSAGE = 0
 _PAGE_CONTENT = 1
 
 _PAGE_OVERVIEW = 0
 _PAGE_PREFIXES = 1
+_PAGE_TOOLS = 2
 
 _INNER_PAGE_MESSAGE = 0
 _INNER_PAGE_TABLE = 1
@@ -80,6 +110,7 @@ _NO_ROOTS_TEXT = (
 )
 _NO_PREFIXES_TEXT = "Steam libraries were found, but no Proton prefixes exist yet."
 _NO_ROWS_TEXT = "No prefixes match the current view."
+_NO_TOOLS_ROWS_TEXT = "No tools match the current view."
 
 _SCAN_WAIT_MS = 2000
 
@@ -89,6 +120,295 @@ _TYPE_LABELS = {
     PrefixType.ORPHANED: "Orphaned",
 }
 _SEARCH_TARGETS = {"name": "Name", "app_id": "AppID"}
+
+_TOOL_CHECK_COLUMN = 0
+_TOOL_NAME_COLUMN = 1
+_TOOL_SIZE_COLUMN = 2
+_TOOL_STATUS_COLUMN = 3
+_TOOL_COLUMN_COUNT = 4
+
+_TOOL_HEADER_LABELS = {
+    _TOOL_NAME_COLUMN: "Name",
+    _TOOL_SIZE_COLUMN: "Size",
+    _TOOL_STATUS_COLUMN: "Status",
+}
+
+_TOOL_STATUS_USED = "Used"
+_TOOL_STATUS_READ_ONLY = "Read-only"
+_TOOL_STATUS_UNUSED = "Unused"
+
+_TOOL_SORTABLE_COLUMNS = {
+    _TOOL_NAME_COLUMN: "name",
+    _TOOL_SIZE_COLUMN: "size",
+    _TOOL_STATUS_COLUMN: "status",
+}
+
+_TOOL_STATUS_FILTERS = (_TOOL_STATUS_USED, _TOOL_STATUS_UNUSED, _TOOL_STATUS_READ_ONLY)
+
+_TOOL_MODEL_ROOT_INDEX = QModelIndex()
+
+
+def _tool_status(tool: Tool, used: set[str]) -> str:
+    if str(tool.path) in used:
+        return _TOOL_STATUS_USED
+    if tool.read_only:
+        return _TOOL_STATUS_READ_ONLY
+    return _TOOL_STATUS_UNUSED
+
+
+def _tool_facets(tool: Tool, used: set[str]) -> set[str]:
+    """Status labels applying to a tool; used and read-only can overlap."""
+    facets: set[str] = set()
+    if str(tool.path) in used:
+        facets.add(_TOOL_STATUS_USED)
+    if tool.read_only:
+        facets.add(_TOOL_STATUS_READ_ONLY)
+    if not facets:
+        facets.add(_TOOL_STATUS_UNUSED)
+    return facets
+
+
+class ToolTableModel(QAbstractTableModel):
+    """Read-only tool rows with checkboxes limited to deletable tools.
+
+    Only unused writable tools are checkable. Used and read-only tools
+    render without a checkbox and cannot be selected for delete.
+    """
+
+    selection_changed = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._tools: list[Tool] = []
+        self._used_by: dict[str, list[int]] = {}
+        self._names: dict[int, str] = {}
+        self._pending: set[str] = set()
+        self._failed: set[str] = set()
+        self._selected: set[str] = set()
+
+    def set_items(
+        self,
+        tools: Sequence[Tool],
+        used_by: dict[str, list[int]],
+        names: dict[int, str],
+    ) -> None:
+        self.beginResetModel()
+        self._tools = list(tools)
+        self._used_by = dict(used_by)
+        self._names = dict(names)
+        self._pending = {str(tool.path) for tool in tools}
+        self._failed.clear()
+        self._selected.clear()
+        self.endResetModel()
+        self.selection_changed.emit()
+
+    @property
+    def used(self) -> set[str]:
+        return set(self._used_by)
+
+    @property
+    def pending(self) -> set[str]:
+        return set(self._pending)
+
+    def set_tool_size(self, path: str, size_bytes: int, error: str | None) -> None:
+        """Store one async size result and refresh its size cell."""
+        self._pending.discard(path)
+        if error is not None:
+            self._failed.add(path)
+        else:
+            self._failed.discard(path)
+        for row, tool in enumerate(self._tools):
+            if str(tool.path) == path:
+                self._tools[row] = replace(tool, size_bytes=size_bytes)
+                self.dataChanged.emit(
+                    self.index(row, _TOOL_SIZE_COLUMN),
+                    self.index(row, _TOOL_SIZE_COLUMN),
+                )
+                return
+
+    def mark_pending_unavailable(self) -> None:
+        """Move leftover pending rows to failed so none stay Scanning.
+
+        Called when the size worker finishes without reporting a row
+        (worker never started, stopped early, or dropped a signal).
+        Failed rows render as Unavailable, never as a false zero size.
+        """
+        if not self._pending:
+            return
+        self._failed.update(self._pending)
+        self._pending.clear()
+        if self._tools:
+            self.dataChanged.emit(
+                self.index(0, _TOOL_SIZE_COLUMN),
+                self.index(len(self._tools) - 1, _TOOL_SIZE_COLUMN),
+            )
+
+    def selected_tools(self) -> list[Tool]:
+        return [tool for tool in self._tools if str(tool.path) in self._selected]
+
+    def rows(self) -> list[Tool]:
+        return list(self._tools)
+
+    def is_selected(self, tool: Tool) -> bool:
+        return str(tool.path) in self._selected
+
+    def is_deletable(self, tool: Tool) -> bool:
+        return str(tool.path) not in self.used and not tool.read_only
+
+    def set_visible(self, tools: Sequence[Tool]) -> None:
+        """Re-slice visible rows, dropping selections hidden by the filter."""
+        self.beginResetModel()
+        self._tools = list(tools)
+        visible = {str(tool.path) for tool in tools}
+        self._selected = {key for key in self._selected if key in visible}
+        self.endResetModel()
+        self.selection_changed.emit()
+
+    def set_visible_deletable_selected(self, selected: bool) -> None:
+        """Check or clear every deletable visible row."""
+        for tool in self._tools:
+            if self.is_deletable(tool):
+                key = str(tool.path)
+                if selected:
+                    self._selected.add(key)
+                else:
+                    self._selected.discard(key)
+        if self._tools:
+            self.dataChanged.emit(
+                self.index(0, _TOOL_CHECK_COLUMN),
+                self.index(len(self._tools) - 1, _TOOL_CHECK_COLUMN),
+            )
+        self.selection_changed.emit()
+
+    def rowCount(self, parent: QModelIndex | QPersistentModelIndex = _TOOL_MODEL_ROOT_INDEX) -> int:
+        return 0 if parent.isValid() else len(self._tools)
+
+    def columnCount(
+        self, parent: QModelIndex | QPersistentModelIndex = _TOOL_MODEL_ROOT_INDEX
+    ) -> int:
+        return _TOOL_COLUMN_COUNT
+
+    def data(
+        self,
+        index: QModelIndex | QPersistentModelIndex,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> object:
+        if not index.isValid():
+            return None
+        if not 0 <= index.row() < len(self._tools):
+            return None
+        tool = self._tools[index.row()]
+        column = index.column()
+        if role == Qt.ItemDataRole.DisplayRole:
+            return self._display_text(tool, column)
+        if column == _TOOL_CHECK_COLUMN and role == Qt.ItemDataRole.CheckStateRole:
+            if not self.is_deletable(tool):
+                return None
+            selected = str(tool.path) in self._selected
+            state = Qt.CheckState.Checked if selected else Qt.CheckState.Unchecked
+            return int(state.value)
+        if role == Qt.ItemDataRole.ToolTipRole and column == _TOOL_NAME_COLUMN:
+            return self._name_tooltip(tool)
+        if role == Qt.ItemDataRole.ToolTipRole and column == _TOOL_CHECK_COLUMN:
+            if not self.is_deletable(tool):
+                return self._lock_reason(tool)
+        if (
+            column == _TOOL_CHECK_COLUMN
+            and role == Qt.ItemDataRole.DecorationRole
+            and not self.is_deletable(tool)
+            and QApplication.instance() is not None
+        ):
+            icon: QIcon = QApplication.style().standardIcon(
+                QStyle.StandardPixmap.SP_MessageBoxInformation
+            )
+            if icon.isNull():
+                return None
+            return icon
+        if role == Qt.ItemDataRole.TextAlignmentRole and column == _TOOL_SIZE_COLUMN:
+            return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        return None
+
+    def flags(self, index: QModelIndex | QPersistentModelIndex) -> Qt.ItemFlag:
+        base = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        if not 0 <= index.row() < len(self._tools):
+            return base
+        if index.column() == _TOOL_CHECK_COLUMN and self.is_deletable(self._tools[index.row()]):
+            return base | Qt.ItemFlag.ItemIsUserCheckable
+        return base
+
+    def setData(
+        self,
+        index: QModelIndex | QPersistentModelIndex,
+        value: object,
+        role: int = Qt.ItemDataRole.EditRole,
+    ) -> bool:
+        if role != Qt.ItemDataRole.CheckStateRole or index.column() != _TOOL_CHECK_COLUMN:
+            return False
+        if not 0 <= index.row() < len(self._tools):
+            return False
+        tool = self._tools[index.row()]
+        if not self.is_deletable(tool):
+            return False
+        checked = value in (Qt.CheckState.Checked, int(Qt.CheckState.Checked.value), True)
+        key = str(tool.path)
+        if checked:
+            self._selected.add(key)
+        else:
+            self._selected.discard(key)
+        self.dataChanged.emit(index, index)
+        self.selection_changed.emit()
+        return True
+
+    def headerData(
+        self,
+        section: int,
+        orientation: Qt.Orientation,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> object:
+        if orientation != Qt.Orientation.Horizontal or role != Qt.ItemDataRole.DisplayRole:
+            return None
+        return _TOOL_HEADER_LABELS.get(section)
+
+    def _display_text(self, tool: Tool, column: int) -> str:
+        if column == _TOOL_NAME_COLUMN:
+            return tool.name
+        if column == _TOOL_SIZE_COLUMN:
+            if str(tool.path) in self._pending:
+                return "Scanning..."
+            if str(tool.path) in self._failed:
+                return "Unavailable"
+            return format_size(tool.size_bytes)
+        if column == _TOOL_STATUS_COLUMN:
+            return _tool_status(tool, self.used)
+        return ""
+
+    def _name_tooltip(self, tool: Tool) -> str:
+        lines: list[str] = []
+        app_ids = self._used_by.get(str(tool.path), [])
+        if app_ids:
+            parts: list[str] = []
+            for app_id in app_ids:
+                name = self._names.get(app_id)
+                if name:
+                    parts.append(f"{name} ({app_id})")
+                else:
+                    parts.append(f"AppID {app_id}")
+            lines.append("Used by: " + ", ".join(parts))
+        if tool.read_only:
+            lines.append("Read-only: this build cannot be removed from this app.")
+        lines.append(str(tool.path))
+        return "\n".join(lines)
+
+    def _lock_reason(self, tool: Tool) -> str:
+        # Tooltip-only HTML: DisplayRole never returns markup, so plain-text
+        # cells cannot leak these tags. The bold tail is for tooltips only.
+        tail = "<b>It cannot be removed from this app.</b>"
+        if tool.read_only:
+            system = SYSTEM_TOOLS_DIR.resolve(strict=False)
+            if tool.path == system or system in tool.path.parents:
+                return f"System-owned: this build belongs to the package manager. {tail}"
+            return f"Steam-managed: this build belongs to Steam. {tail}"
+        return f"In use: this build is selected by a game. {tail}"
 
 
 class MainWindow(QMainWindow):
@@ -115,6 +435,15 @@ class MainWindow(QMainWindow):
         self._tool_mapping: dict[int, str] = {}
         self._tool_errors: list[ToolMapError] = []
         self._warning_count: int = 0
+        self._all_tools: list[Tool] = []
+        self._tools_search_text = ""
+        self._tools_statuses: set[str] = {
+            _TOOL_STATUS_USED,
+            _TOOL_STATUS_UNUSED,
+            _TOOL_STATUS_READ_ONLY,
+        }
+        self._tools_sort_key = "name"
+        self._tools_sort_descending = False
         self._filter_types: set[PrefixType] = set(self._config.type_filter)
         self._search_text = ""
         self._search_target = "name"
@@ -123,6 +452,11 @@ class MainWindow(QMainWindow):
         self._delete_done = 0
         self._deletion_results: list[DeletionResult] = []
         self._delete_mode: DeleteMode | None = None
+        self._tools_deleting = False
+        self._tools_delete_total = 0
+        self._tools_delete_done = 0
+        self._tools_deletion_results: list[ToolDeletionResult] = []
+        self._tools_delete_mode: DeleteMode | None = None
         self._disk_capacity: int | None = None
         self._pending_filter_reset = False
         self._pending_select_all_visible = False
@@ -134,6 +468,7 @@ class MainWindow(QMainWindow):
         )
         self._table = PrefixTable(self._model)
         self._store = self._model.store
+        self._tools_model = ToolTableModel()
 
         self._message_icon_label = QLabel()
         self._message_icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -218,6 +553,7 @@ class MainWindow(QMainWindow):
         self._tabs = QTabWidget()
         self._tabs.addTab(self._overview, "Overview")
         self._tabs.addTab(prefixes_page, "Prefixes")
+        self._tabs.addTab(self._build_tools_page(), "Tools")
 
         content = QWidget()
         content_layout = QVBoxLayout(content)
@@ -301,6 +637,250 @@ class MainWindow(QMainWindow):
         self._update_delete_button()
         return bar
 
+    def _build_tools_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._build_tools_filter_bar(page))
+        self._tools_table = QTableView(page)
+        self._tools_table.setModel(self._tools_model)
+        header = shared_view_settings(self._tools_table)
+        header.setSectionResizeMode(_TOOL_CHECK_COLUMN, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(_TOOL_NAME_COLUMN, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(_TOOL_SIZE_COLUMN, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(_TOOL_STATUS_COLUMN, QHeaderView.ResizeMode.Interactive)
+        header.setSortIndicator(_TOOL_NAME_COLUMN, Qt.SortOrder.AscendingOrder)
+        header.sectionClicked.connect(self._on_tools_section_clicked)
+        self._tools_table.setColumnWidth(_TOOL_CHECK_COLUMN, CHECK_WIDTH_PX)
+        self._tools_header_checkbox = QCheckBox(header)
+        self._tools_header_checkbox.setTristate(True)
+        self._tools_header_checkbox.clicked.connect(self._on_tools_header_toggle)
+        header.geometriesChanged.connect(self._reposition_tools_header_checkbox)
+        self._tools_model.selection_changed.connect(self._on_tools_selection_changed)
+        layout.addWidget(self._tools_table)
+        layout.addWidget(self._build_tools_action_bar(page))
+        return page
+
+    def _build_tools_filter_bar(self, parent: QWidget) -> QWidget:
+        bar = QWidget(parent)
+        layout = QHBoxLayout(bar)
+        self._tools_status_button = QToolButton(bar)
+        self._tools_status_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self._tools_status_button.setText("Filters")
+        status_menu = QMenu(self._tools_status_button)
+        self._tools_status_actions: dict[str, QAction] = {}
+        for label in _TOOL_STATUS_FILTERS:
+            action = status_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(label in self._tools_statuses)
+            action.toggled.connect(
+                lambda checked, text=label: self._on_tools_status_toggled(text, checked)
+            )
+            self._tools_status_actions[label] = action
+        self._tools_status_button.setMenu(status_menu)
+        self._tools_status_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        layout.addWidget(self._tools_status_button)
+        search_frame = QFrame(bar)
+        search_frame.setObjectName("toolsSearchFrame")
+        search_layout = QHBoxLayout(search_frame)
+        search_layout.setContentsMargins(0, 0, 0, 0)
+        search_layout.setSpacing(0)
+        self._tools_search_box = QLineEdit(search_frame)
+        self._tools_search_box.setClearButtonEnabled(True)
+        self._tools_search_box.setPlaceholderText("Search tools")
+        self._tools_search_box.textChanged.connect(self._on_tools_search_text_changed)
+        search_layout.addWidget(self._tools_search_box, stretch=1)
+        layout.addWidget(search_frame, stretch=1)
+        self._tools_search_timer = QTimer(self)
+        self._tools_search_timer.setSingleShot(True)
+        self._tools_search_timer.setInterval(SEARCH_DEBOUNCE_MS)
+        self._tools_search_timer.timeout.connect(self._apply_tools_filter)
+        self._update_tools_status_summary()
+        return bar
+
+    def _build_tools_action_bar(self, parent: QWidget) -> QWidget:
+        bar = QWidget(parent)
+        layout = QHBoxLayout(bar)
+        layout.addStretch(1)
+        self._delete_tools_button = QPushButton(bar)
+        self._delete_tools_button.clicked.connect(self._on_delete_tools_clicked)
+        layout.addWidget(self._delete_tools_button)
+        self._update_delete_tools_button()
+        return bar
+
+    def _update_delete_tools_button(self) -> None:
+        count = len(self._tools_model.selected_tools())
+        self._delete_tools_button.setText(f"Delete Tools ({count})")
+        self._delete_tools_button.setEnabled(
+            count > 0 and not self._tools_deleting and not self._deleting
+        )
+
+    def _on_tools_selection_changed(self) -> None:
+        self._update_delete_tools_button()
+        self._update_tools_header_state()
+
+    def _update_tools_header_state(self) -> None:
+        rows = self._tools_model.rows()
+        deletable = [tool for tool in rows if self._tools_model.is_deletable(tool)]
+        box = self._tools_header_checkbox
+        box.blockSignals(True)
+        if not deletable:
+            box.setCheckState(Qt.CheckState.Unchecked)
+        else:
+            selected = sum(1 for tool in deletable if self._tools_model.is_selected(tool))
+            if selected == 0:
+                box.setCheckState(Qt.CheckState.Unchecked)
+            elif selected == len(deletable):
+                box.setCheckState(Qt.CheckState.Checked)
+            else:
+                box.setCheckState(Qt.CheckState.PartiallyChecked)
+        box.blockSignals(False)
+        self._reposition_tools_header_checkbox()
+
+    def _reposition_tools_header_checkbox(self) -> None:
+        """Center the checkbox inside the tools header check section."""
+        header = self._tools_table.horizontalHeader()
+        hint = self._tools_header_checkbox.sizeHint()
+        section_width = max(header.sectionSize(_TOOL_CHECK_COLUMN), hint.width())
+        x = header.sectionPosition(_TOOL_CHECK_COLUMN)
+        y = max((header.height() - hint.height()) // 2, 0)
+        self._tools_header_checkbox.setGeometry(
+            x + (section_width - hint.width()) // 2,
+            y,
+            hint.width(),
+            hint.height(),
+        )
+
+    def _on_tools_header_toggle(self) -> None:
+        rows = self._tools_model.rows()
+        deletable = [tool for tool in rows if self._tools_model.is_deletable(tool)]
+        if not deletable:
+            return
+        all_selected = all(self._tools_model.is_selected(tool) for tool in deletable)
+        self._tools_model.set_visible_deletable_selected(not all_selected)
+
+    def _tools_status_summary_text(self) -> str:
+        # Both filter buttons read Filters and expose the facet in the
+        # tooltip, matching the prefixes tab which uses Types: here.
+        checked = [label for label in _TOOL_STATUS_FILTERS if label in self._tools_statuses]
+        if not checked:
+            return "Status: None"
+        return "Status: " + " + ".join(checked)
+
+    def _update_tools_status_summary(self) -> None:
+        self._tools_status_button.setToolTip(self._tools_status_summary_text())
+
+    def _on_tools_status_toggled(self, label: str, checked: bool) -> None:
+        if checked:
+            self._tools_statuses.add(label)
+        else:
+            self._tools_statuses.discard(label)
+        self._update_tools_status_summary()
+        self._apply_tools_filter()
+
+    def _on_tools_search_text_changed(self, text: str) -> None:
+        self._tools_search_text = text.strip()
+        self._tools_search_timer.start()
+
+    def _apply_tools_filter(self) -> None:
+        """Re-slice all tools through status and search into the model."""
+        text = self._tools_search_text.strip().casefold()
+        used = self._tools_model.used
+        visible = [
+            tool
+            for tool in self._all_tools
+            if _tool_facets(tool, used) & self._tools_statuses
+            and (not text or text in tool.name.casefold())
+        ]
+        if self._tools_sort_key == "size":
+            visible.sort(key=lambda tool: tool.size_bytes, reverse=self._tools_sort_descending)
+        elif self._tools_sort_key == "status":
+            visible.sort(
+                key=lambda tool: _tool_status(tool, used),
+                reverse=self._tools_sort_descending,
+            )
+        else:
+            visible.sort(key=lambda tool: tool.name.casefold(), reverse=self._tools_sort_descending)
+        self._tools_model.set_visible(visible)
+        if not visible and self._all_tools:
+            self._status.showMessage(_NO_TOOLS_ROWS_TEXT, 5000)
+        elif self._status.currentMessage() == _NO_TOOLS_ROWS_TEXT:
+            self._status.clearMessage()
+
+    def _on_tools_section_clicked(self, section: int) -> None:
+        key = _TOOL_SORTABLE_COLUMNS.get(section)
+        if key is None:
+            return
+        if key == self._tools_sort_key:
+            self._tools_sort_descending = not self._tools_sort_descending
+        else:
+            self._tools_sort_key = key
+            self._tools_sort_descending = key == "size"
+        order = (
+            Qt.SortOrder.DescendingOrder
+            if self._tools_sort_descending
+            else Qt.SortOrder.AscendingOrder
+        )
+        self._tools_table.horizontalHeader().setSortIndicator(section, order)
+        self._apply_tools_filter()
+
+    def _on_delete_tools_clicked(self) -> None:
+        tools = self._tools_model.selected_tools()
+        if not tools or self._tools_deleting or self._deleting:
+            return
+        names = [tool.name for tool in tools]
+        total_text = format_size(sum(tool.size_bytes for tool in tools))
+        note = tools_pending_note_for(tools, self._tools_model.pending)
+        if not confirm_selection(self, names, total_text, note, item_noun="tools"):
+            return
+        mode = confirm_final(self, len(tools), total_text, item_noun="tool(s)")
+        if mode is None:
+            return
+        self._tools_deleting = True
+        self._tools_delete_total = len(tools)
+        self._tools_delete_done = 0
+        self._tools_deletion_results.clear()
+        self._tools_delete_mode = mode
+        self._update_delete_button()
+        self._update_delete_tools_button()
+        self._refresh_action.setEnabled(False)
+        self._status.showMessage(f"Deleting 0/{self._tools_delete_total}")
+        epoch = self._epoch
+        worker = ToolDeletionWorker(tools, self._roots, mode, epoch)
+        self._workers.add(worker)
+        worker.signals.result_ready.connect(self._on_tool_deletion_result)
+        worker.signals.finished.connect(lambda ep, w=worker: self._on_tool_deletion_finished(ep, w))
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_tool_deletion_result(self, result: ToolDeletionResult, epoch: int) -> None:
+        if epoch != self._epoch:
+            return
+        self._tools_deletion_results.append(result)
+        self._tools_delete_done += 1
+        self._status.showMessage(f"Deleting {self._tools_delete_done}/{self._tools_delete_total}")
+
+    def _on_tool_deletion_finished(self, epoch: int, worker: QRunnable | None = None) -> None:
+        self._workers.discard(worker)
+        if epoch != self._epoch:
+            self._tools_deleting = False
+            if not self._deleting and not self._tools_deleting:
+                self._refresh_action.setEnabled(True)
+            self._update_delete_button()
+            self._update_delete_tools_button()
+            if self._status.currentMessage().startswith("Deleting"):
+                self._status.clearMessage()
+            return
+        results = list(self._tools_deletion_results)
+        self._tools_deleting = False
+        if not self._deleting and not self._tools_deleting:
+            self._refresh_action.setEnabled(True)
+        self._update_delete_button()
+        self._update_delete_tools_button()
+        self._status.clearMessage()
+        if any(result.status is not DeletionStatus.DELETED for result in results):
+            show_deletion_summary(self, results)
+        self.refresh()
+
     def _type_summary_text(self) -> str:
         checked = [
             pt
@@ -372,11 +952,13 @@ class MainWindow(QMainWindow):
     def _update_delete_button(self) -> None:
         count = len(self._store.selected())
         self._delete_button.setText(f"Delete Prefixes ({count})")
-        self._delete_button.setEnabled(count > 0 and not self._deleting)
+        self._delete_button.setEnabled(
+            count > 0 and not self._deleting and not self._tools_deleting
+        )
 
     def _on_delete_clicked(self) -> None:
         selected = self._store.selected()
-        if not selected or self._deleting:
+        if not selected or self._deleting or self._tools_deleting:
             return
         names, total_text = self._selected_summary()
         if not confirm_selection(self, names, total_text, unscanned_note_for(selected)):
@@ -390,6 +972,7 @@ class MainWindow(QMainWindow):
         self._deletion_results.clear()
         self._delete_mode = mode
         self._update_delete_button()
+        self._update_delete_tools_button()
         self._refresh_action.setEnabled(False)
         self._status.showMessage(f"Deleting 0/{self._delete_total}")
         epoch = self._epoch
@@ -409,6 +992,13 @@ class MainWindow(QMainWindow):
     def _on_deletion_finished(self, epoch: int, worker: QRunnable | None = None) -> None:
         self._workers.discard(worker)
         if epoch != self._epoch:
+            self._deleting = False
+            if not self._deleting and not self._tools_deleting:
+                self._refresh_action.setEnabled(True)
+            self._update_delete_button()
+            self._update_delete_tools_button()
+            if self._status.currentMessage().startswith("Deleting"):
+                self._status.clearMessage()
             return
         results = list(self._deletion_results)
         for result in results:
@@ -416,8 +1006,10 @@ class MainWindow(QMainWindow):
                 invalidate(self._config.size_cache, result.prefix)
         save_config(self._config)
         self._deleting = False
-        self._refresh_action.setEnabled(True)
+        if not self._deleting and not self._tools_deleting:
+            self._refresh_action.setEnabled(True)
         self._update_delete_button()
+        self._update_delete_tools_button()
         self._status.clearMessage()
         if any(r.status is not DeletionStatus.DELETED for r in results):
             show_deletion_summary(self, results)
@@ -475,7 +1067,7 @@ class MainWindow(QMainWindow):
 
     def refresh(self) -> None:
         """Start one full pipeline run; stale runs are dropped via the epoch."""
-        if self._deleting:
+        if self._deleting or self._tools_deleting:
             return
         self._epoch += 1
         epoch = self._epoch
@@ -504,6 +1096,27 @@ class MainWindow(QMainWindow):
         self._libraries = list(result.libraries)
         self._tool_mapping, self._tool_errors = load_tool_mapping(self._roots)
         self._model.set_tool_provider(self._tool_for)
+        tools = enumerate_tools(self._roots, self._libraries)
+        prefix_names: dict[int, str] = {}
+        for prefix in prefixes:
+            prefix_names.setdefault(prefix.app_id, prefix.name)
+        self._tools_model.set_items(tools, used_by(tools, self._tool_mapping), prefix_names)
+        self._all_tools = list(tools)
+        self._apply_tools_filter()
+        if tools:
+            size_worker = ToolSizeWorker(tools, epoch)
+            self._workers.add(size_worker)
+            size_worker.signals.sized.connect(self._on_tool_sized)
+            size_worker.signals.finished.connect(
+                lambda ep, w=size_worker: self._on_tool_size_finished(ep, w)
+            )
+            try:
+                QThreadPool.globalInstance().start(size_worker)
+            except RuntimeError:
+                self._workers.discard(size_worker)
+                self._tools_model.mark_pending_unavailable()
+        else:
+            self._tools_model.mark_pending_unavailable()
         warning_count = len(result.errors) + len(self._tool_errors)
         self._warning_count = warning_count
         if warning_count:
@@ -581,6 +1194,29 @@ class MainWindow(QMainWindow):
         if self._warning_count:
             self._status.showMessage(f"warnings: {self._warning_count}", 5000)
         save_config(self._config)
+
+    def _on_tool_sized(self, payload: object, epoch: int) -> None:
+        if epoch != self._epoch or not isinstance(payload, tuple) or len(payload) != 3:
+            return
+        path, size_bytes, error = payload
+        if (
+            isinstance(path, str)
+            and isinstance(size_bytes, int)
+            and (error is None or isinstance(error, str))
+        ):
+            self._all_tools = [
+                replace(tool, size_bytes=size_bytes) if str(tool.path) == path else tool
+                for tool in self._all_tools
+            ]
+            self._tools_model.set_tool_size(path, size_bytes, error)
+            if self._tools_sort_key == "size":
+                self._apply_tools_filter()
+
+    def _on_tool_size_finished(self, epoch: int, worker: QRunnable | None = None) -> None:
+        self._workers.discard(worker)
+        if epoch != self._epoch:
+            return
+        self._tools_model.mark_pending_unavailable()
 
     def _on_sort_column_clicked(self, section: int) -> None:
         key = SORTABLE_COLUMNS.get(section)

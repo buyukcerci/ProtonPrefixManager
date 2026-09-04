@@ -57,16 +57,16 @@ QHeaderView::section {{
     padding: {HEADER_PADDING_PX}px {HEADER_H_PADDING_PX}px;
     font-weight: 600;
 }}
-QFrame#searchFrame {{
+QFrame#searchFrame, QFrame#toolsSearchFrame {{
     border: 1px solid palette(mid);
     border-radius: 4px;
 }}
-QFrame#searchFrame QComboBox {{
+QFrame#searchFrame QComboBox, QFrame#toolsSearchFrame QComboBox {{
     border: none;
     background: transparent;
     padding: 2px 4px;
 }}
-QFrame#searchFrame QLineEdit {{
+QFrame#searchFrame QLineEdit, QFrame#toolsSearchFrame QLineEdit {{
     border: none;
     background: transparent;
     padding: 2px 4px;

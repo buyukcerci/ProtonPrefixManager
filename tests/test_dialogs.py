@@ -9,11 +9,13 @@ from PySide6.QtWidgets import QDialog
 
 from core.deletion import DeleteMode, DeletionResult, DeletionStatus, FailureKind, RejectReason
 from core.models import Prefix, PrefixType
+from core.tools import Tool
 from ui.dialogs import (
     confirm_final,
     confirm_selection,
     selection_body,
     summary_body,
+    tools_pending_note_for,
 )
 
 
@@ -42,6 +44,13 @@ def test_selection_body_total_size_and_note() -> None:
     assert "Total size: 12 B" in with_note
     assert note in with_note
     assert note not in without_note
+
+
+def test_selection_body_item_noun_defaults_to_prefixes() -> None:
+    assert "prefixes will be removed" in selection_body(["one"], "12 B", None)
+    tools_body = selection_body(["one"], "12 B", None, item_noun="tools")
+    assert "tools will be removed" in tools_body
+    assert "prefixes" not in tools_body
 
 
 def test_confirm_selection_accept_and_reject(
@@ -107,6 +116,40 @@ def test_confirm_final_irreversibility_wording_present(
     monkeypatch.setattr(QDialog, "exec", fake_exec)
     assert confirm_final(None, 3, "9 B") is None
     assert any("cannot be undone" in text for text in texts)
+
+
+def test_confirm_final_item_noun_defaults_to_prefixes(
+    qapp,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from PySide6.QtWidgets import QLabel
+
+    seen: list[str] = []
+
+    def fake_exec(self: QDialog) -> QDialog.DialogCode:
+        seen.extend(label.text() for label in self.findChildren(QLabel))
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(QDialog, "exec", fake_exec)
+    assert confirm_final(None, 2, "1.5 KB") is None
+    assert any("2 prefix(es) totaling" in text for text in seen)
+    seen.clear()
+    assert confirm_final(None, 2, "1.5 KB", item_noun="tool(s)") is None
+    assert any("2 tool(s) totaling" in text for text in seen)
+    assert all("prefix" not in text for text in seen)
+
+
+def _tool(name: str, base: Path) -> Tool:
+    return Tool(name=name, path=base / name, root=base, read_only=False)
+
+
+def test_tools_pending_note_for_selection(tmp_path: Path) -> None:
+    tools = [_tool("Alpha", tmp_path), _tool("Beta", tmp_path)]
+    note = tools_pending_note_for(tools, {str(tools[0].path)})
+    assert note is not None
+    assert "total may be understated" in note
+    assert tools_pending_note_for(tools, set()) is None
+    assert tools_pending_note_for([], {str(tools[0].path)}) is None
 
 
 def test_summary_body_lists_every_non_deleted_result() -> None:

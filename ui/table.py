@@ -326,6 +326,20 @@ class PrefixTableModel(QAbstractTableModel):
         return None
 
 
+def shared_view_settings(view: QTableView) -> QHeaderView:
+    """Apply the view settings shared by the prefix and tool tables."""
+    view.setSelectionMode(QTableView.SelectionMode.NoSelection)
+    view.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+    view.verticalHeader().setVisible(False)
+    view.setAlternatingRowColors(True)
+    header = view.horizontalHeader()
+    header.setSectionsClickable(True)
+    header.setSortIndicatorShown(True)
+    header.setMinimumSectionSize(MIN_HEADER_SECTION_PX)
+    header.setMinimumHeight(int(view.fontMetrics().height() * HEADER_HEIGHT_RATIO))
+    return header
+
+
 class PrefixTable(QTableView):
     """Table view wiring header clicks to Store-backed sorting."""
 
@@ -336,14 +350,7 @@ class PrefixTable(QTableView):
         super().__init__()
         self._model = model
         self.setModel(model)
-        self.setSelectionMode(QTableView.SelectionMode.NoSelection)
-        self.setTextElideMode(Qt.TextElideMode.ElideMiddle)
-        self.verticalHeader().setVisible(False)
-        self.setAlternatingRowColors(True)
-        header = self.horizontalHeader()
-        header.setSectionsClickable(True)
-        header.setSortIndicatorShown(True)
-        header.setMinimumSectionSize(MIN_HEADER_SECTION_PX)
+        header = shared_view_settings(self)
         header.setSectionResizeMode(CHECK_COLUMN, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(APP_ID_COLUMN, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(NAME_COLUMN, QHeaderView.ResizeMode.Interactive)
@@ -351,7 +358,6 @@ class PrefixTable(QTableView):
         header.setSectionResizeMode(SIZE_COLUMN, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(MODIFIED_COLUMN, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(OPEN_COLUMN, QHeaderView.ResizeMode.Fixed)
-        header.setMinimumHeight(int(self.fontMetrics().height() * HEADER_HEIGHT_RATIO))
         self.setColumnWidth(CHECK_COLUMN, CHECK_WIDTH_PX)
         self.setColumnWidth(OPEN_COLUMN, OPEN_WIDTH_PX)
         self.setColumnWidth(APP_ID_COLUMN, APP_ID_DEFAULT_PX)

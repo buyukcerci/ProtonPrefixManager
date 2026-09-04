@@ -18,17 +18,33 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.deletion import DeleteMode, DeletionResult, DeletionStatus
+from core.deletion import (
+    DeleteMode,
+    DeletionResult,
+    DeletionStatus,
+    ToolDeletionResult,
+)
 from core.models import Prefix, ScanStatus
+from core.tools import Tool
 
 MAX_LISTED_NAMES = 8
 
 
-def selection_body(names: Sequence[str], total_text: str, unscanned_note: str | None) -> str:
-    """Shared body text for confirm_selection, exposed for content tests."""
+def selection_body(
+    names: Sequence[str],
+    total_text: str,
+    unscanned_note: str | None,
+    item_noun: str = "prefixes",
+) -> str:
+    """Shared body text for confirm_selection, exposed for content tests.
+
+    The plural noun mirrors the prefixes tab wording on purpose; callers
+    pass tools for the tools tab. Count-specific singular handling stays
+    out to keep the dialog API stable.
+    """
     listed = list(names[:MAX_LISTED_NAMES])
     overflow = len(names) - len(listed)
-    lines = ["The following prefixes will be removed:", ""]
+    lines = [f"The following {item_noun} will be removed:", ""]
     lines.extend(listed)
     if overflow > 0:
         lines.append(f"and {overflow} more")
@@ -44,12 +60,13 @@ def confirm_selection(
     names: Sequence[str],
     total_text: str,
     unscanned_note: str | None,
+    item_noun: str = "prefixes",
 ) -> bool:
     """First confirmation: what will be removed and how big it is."""
     dialog = QDialog(parent)
     dialog.setWindowTitle("Review selection")
     layout = QVBoxLayout(dialog)
-    label = QLabel(selection_body(names, total_text, unscanned_note))
+    label = QLabel(selection_body(names, total_text, unscanned_note, item_noun))
     label.setWordWrap(True)
     layout.addWidget(label)
     buttons = QDialogButtonBox(
@@ -67,14 +84,23 @@ def _radio_mode(trash: QRadioButton, permanent: QRadioButton) -> DeleteMode:
     return DeleteMode.PERMANENT if permanent.isChecked() else DeleteMode.TRASH
 
 
-def confirm_final(parent: QWidget | None, count: int, size_text: str) -> DeleteMode | None:
-    """Second confirmation: irreversibility wording plus the mode choice."""
+def confirm_final(
+    parent: QWidget | None,
+    count: int,
+    size_text: str,
+    item_noun: str = "prefix(es)",
+) -> DeleteMode | None:
+    """Second confirmation: irreversibility wording plus the mode choice.
+
+    The compact plural mirrors the prefixes tab; the tools tab passes
+    tool(s) through the same path.
+    """
     dialog = QDialog(parent)
     dialog.setWindowTitle("Confirm deletion")
     layout = QVBoxLayout(dialog)
     warning = QLabel(
         f"This cannot be undone.\n\n"
-        f"{count} prefix(es) totaling {size_text} will be removed.\n"
+        f"{count} {item_noun} totaling {size_text} will be removed.\n"
         "Choose how they should be removed:"
     )
     warning.setWordWrap(True)
@@ -96,7 +122,7 @@ def confirm_final(parent: QWidget | None, count: int, size_text: str) -> DeleteM
     return _radio_mode(trash_radio, permanent_radio)
 
 
-def summary_body(results: Sequence[DeletionResult]) -> str:
+def summary_body(results: Sequence[DeletionResult | ToolDeletionResult]) -> str:
     """Shared body text for show_deletion_summary, exposed for content tests."""
     deleted = sum(1 for r in results if r.status is DeletionStatus.DELETED)
     problems = [r for r in results if r.status is not DeletionStatus.DELETED]
@@ -107,8 +133,11 @@ def summary_body(results: Sequence[DeletionResult]) -> str:
         lines.append("")
         lines.append("Targets that were not removed:")
         for problem in problems:
-            prefix = problem.prefix
-            header = f"[{prefix.app_id}] {prefix.name}"
+            target = problem.prefix if isinstance(problem, DeletionResult) else problem.tool
+            if isinstance(target, Prefix):
+                header = f"[{target.app_id}] {target.name}"
+            else:
+                header = target.name
             if problem.status is DeletionStatus.REJECTED:
                 reason = problem.reject_reason.value if problem.reject_reason else "rejected"
                 lines.append(f"  {header}: rejected ({reason})")
@@ -119,7 +148,9 @@ def summary_body(results: Sequence[DeletionResult]) -> str:
     return "\n".join(lines)
 
 
-def show_deletion_summary(parent: QWidget | None, results: Sequence[DeletionResult]) -> None:
+def show_deletion_summary(
+    parent: QWidget | None, results: Sequence[DeletionResult | ToolDeletionResult]
+) -> None:
     """Informational summary of one deletion batch; failures are listed."""
     dialog = QDialog(parent)
     dialog.setWindowTitle("Deletion summary")
@@ -139,3 +170,10 @@ def unscanned_note_for(prefixes: Sequence[Prefix]) -> str | None:
     if not unscanned:
         return None
     return "Some sizes have not been scanned yet; the total may be understated."
+
+
+def tools_pending_note_for(tools: Sequence[Tool], pending: set[str]) -> str | None:
+    """Note shown when any selected tool still awaits its size."""
+    if any(str(tool.path) in pending for tool in tools):
+        return "Some tool sizes have not been measured yet; the total may be understated."
+    return None

@@ -11,16 +11,23 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QWidget
 
+from core import tools as tools_module
 from core.config import AppConfig, load_config, save_config
 from core.deletion import DeleteMode
 from core.discovery import DiscoveryResult, Library, RootSource, SteamRoot
 from core.models import Prefix, PrefixType, ScanStatus, format_size, prefix_key
 from core.scanner import ScanEvent, ScanEventKind, save_cached
+from core.tools import Tool
 from ui.main_window import (
     _NO_PREFIXES_TEXT,
     _NO_ROWS_TEXT,
     _PAGE_OVERVIEW,
     _PAGE_PREFIXES,
+    _PAGE_TOOLS,
+    _TOOL_CHECK_COLUMN,
+    _TOOL_NAME_COLUMN,
+    _TOOL_SIZE_COLUMN,
+    _TOOL_STATUS_COLUMN,
     MainWindow,
 )
 from ui.settings import SettingsDialog
@@ -33,6 +40,11 @@ def isolated_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def _isolated_system_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tools_module, "SYSTEM_TOOLS_DIR", tmp_path / "system-tools")
 
 
 def _synthetic_payload(
@@ -548,10 +560,10 @@ def test_search_frame_grouped_control_exists(qtbot, isolated_env: Path) -> None:
 
     window = MainWindow(auto_start=False)
     qtbot.addWidget(window)
-    frame = window.findChild(QFrame, "searchFrame")
-    assert frame is not None
+    frame = window._search_box.parent()
+    assert isinstance(frame, QFrame)
+    assert frame.objectName() == "searchFrame"
     assert window._target_combo.parent() is frame
-    assert window._search_box.parent() is frame
 
 
 def test_orphan_toggle_hides_and_shows(qtbot, isolated_env: Path) -> None:
@@ -578,10 +590,13 @@ def test_all_filters_off_yields_empty_view(qtbot, isolated_env: Path) -> None:
 def test_main_window_has_settings_style_tabs(qtbot, isolated_env: Path) -> None:
     window = MainWindow(auto_start=False)
     qtbot.addWidget(window)
-    assert window._tabs.count() == 2
+    assert window._tabs.count() == 3
     assert window._tabs.tabText(0) == "Overview"
     assert window._tabs.tabText(1) == "Prefixes"
+    assert window._tabs.tabText(2) == "Tools"
     assert window._tabs.currentIndex() == _PAGE_OVERVIEW
+    assert window._delete_tools_button.text() == "Delete Tools (0)"
+    assert not window._delete_tools_button.isEnabled()
 
 
 def test_navigation_switches_pages(qtbot, isolated_env: Path) -> None:
@@ -590,8 +605,566 @@ def test_navigation_switches_pages(qtbot, isolated_env: Path) -> None:
     assert window._tabs.currentIndex() == _PAGE_OVERVIEW
     window._tabs.setCurrentIndex(_PAGE_PREFIXES)
     assert window._tabs.currentIndex() == _PAGE_PREFIXES
+    window._tabs.setCurrentIndex(_PAGE_TOOLS)
+    assert window._tabs.currentIndex() == _PAGE_TOOLS
     window._tabs.setCurrentIndex(_PAGE_OVERVIEW)
     assert window._tabs.currentIndex() == _PAGE_OVERVIEW
+
+
+def test_discovery_populates_tools_tab(qtbot, isolated_env: Path) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    result, prefixes = _synthetic_payload(isolated_env, app_ids=(700,))
+    root = result.roots[0].path
+    toolsdir = root / "compatibilitytools.d" / "GE-Proton9-1"
+    toolsdir.mkdir(parents=True)
+    (toolsdir / "compatibilitytool.vdf").write_text(
+        '"compatibilitytools"\n{\n"compat_tools"\n{\n"GE-Proton9-1"\n{\n'
+        '"install_path" "."\n"display_name" "GE-Proton 9-1"\n}\n}\n}\n',
+        encoding="utf-8",
+    )
+    (toolsdir / "payload.bin").write_bytes(b"x" * 64)
+    stale = root / "compatibilitytools.d" / "OldBuild"
+    stale.mkdir(parents=True)
+    config_dir = root / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "config.vdf").write_text(
+        '"InstallConfigStore"\n{\n"Software"\n{\n"Valve"\n{\n"Steam"\n{\n'
+        '"CompatToolMapping"\n{\n"700"\n{\n"name" "GE-Proton9-1"\n}\n}\n'
+        "}\n}\n}\n}\n",
+        encoding="utf-8",
+    )
+    window._on_discovery_finished((result, prefixes), window._epoch)
+    assert window._tabs.count() == 3
+    window._set_page(_PAGE_TOOLS)
+    assert window._tabs.currentIndex() == _PAGE_TOOLS
+    model = window._tools_model
+    assert [tool.name for tool in model._tools] == ["GE-Proton 9-1", "OldBuild"]
+    assert model.used == {str(model._tools[0].path)}
+    expected = (toolsdir / "compatibilitytool.vdf").stat().st_size + (
+        toolsdir / "payload.bin"
+    ).stat().st_size
+    qtbot.waitUntil(lambda: model._tools[0].size_bytes == expected, timeout=15000)
+    assert window._delete_tools_button.text() == "Delete Tools (0)"
+    assert not window._delete_tools_button.isEnabled()
+
+
+def test_used_tool_tooltip_lists_games(qtbot, isolated_env: Path) -> None:
+    from PySide6.QtCore import Qt
+
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    result, prefixes = _synthetic_payload(isolated_env, app_ids=(700,))
+    root = result.roots[0].path
+    used_dir = root / "compatibilitytools.d" / "UsedBuild"
+    used_dir.mkdir(parents=True)
+    free_dir = root / "compatibilitytools.d" / "FreeBuild"
+    free_dir.mkdir(parents=True)
+    config_dir = root / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "config.vdf").write_text(
+        '"CompatToolMapping"\n{\n"700" "UsedBuild"\n"999" "UsedBuild"\n}\n',
+        encoding="utf-8",
+    )
+    window._on_discovery_finished((result, prefixes), window._epoch)
+    model = window._tools_model
+    rows = {tool.name: row for row, tool in enumerate(model._tools)}
+    tooltip = model.data(
+        model.index(rows["UsedBuild"], _TOOL_NAME_COLUMN), Qt.ItemDataRole.ToolTipRole
+    )
+    assert tooltip is not None
+    assert "Game 700 (700)" in tooltip
+    assert "AppID 999" in tooltip
+    assert str(used_dir.resolve()) in tooltip
+    plain = model.data(
+        model.index(rows["FreeBuild"], _TOOL_NAME_COLUMN), Qt.ItemDataRole.ToolTipRole
+    )
+    assert plain == str(free_dir.resolve())
+
+
+def test_tool_sizes_fill_after_list(qtbot, isolated_env: Path) -> None:
+    from PySide6.QtCore import Qt
+
+    from core.tools import Tool
+    from ui.main_window import ToolTableModel
+
+    model = ToolTableModel()
+    tool = Tool(
+        name="Build",
+        path=isolated_env / "Build",
+        root=isolated_env,
+        read_only=False,
+    )
+    model.set_items([tool], {}, {})
+    pending = model.data(model.index(0, _TOOL_SIZE_COLUMN), Qt.ItemDataRole.DisplayRole)
+    assert pending == "Scanning..."
+    model.set_tool_size(str(tool.path), 128, None)
+    filled = model.data(model.index(0, _TOOL_SIZE_COLUMN), Qt.ItemDataRole.DisplayRole)
+    assert filled == "128 B"
+
+
+def test_stale_tool_size_event_dropped(qtbot, isolated_env: Path) -> None:
+    from PySide6.QtCore import Qt
+
+    from core.tools import Tool
+
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    tool = Tool(
+        name="Build",
+        path=isolated_env / "Build",
+        root=isolated_env,
+        read_only=False,
+    )
+    window._tools_model.set_items([tool], {}, {})
+    window._on_tool_sized((str(tool.path), 128, None), window._epoch + 99)
+    pending = window._tools_model.data(
+        window._tools_model.index(0, _TOOL_SIZE_COLUMN), Qt.ItemDataRole.DisplayRole
+    )
+    assert pending == "Scanning..."
+    window._on_tool_sized((str(tool.path), 128, None), window._epoch)
+    filled = window._tools_model.data(
+        window._tools_model.index(0, _TOOL_SIZE_COLUMN), Qt.ItemDataRole.DisplayRole
+    )
+    assert filled == "128 B"
+
+
+def test_locked_rows_have_no_checkbox_and_reason() -> None:
+    from core.tools import Tool
+    from ui.main_window import _TOOL_CHECK_COLUMN, SYSTEM_TOOLS_DIR, ToolTableModel
+
+    model = ToolTableModel()
+    system = Tool(
+        name="Sys",
+        path=SYSTEM_TOOLS_DIR / "Sys",
+        root=SYSTEM_TOOLS_DIR,
+        read_only=True,
+    )
+    managed = Tool(
+        name="Managed",
+        path=Path("/lib/steamapps/common/Proton 9.0"),
+        root=Path("/lib"),
+        read_only=True,
+    )
+    used = Tool(
+        name="Used",
+        path=Path("/root/compatibilitytools.d/Used"),
+        root=Path("/root"),
+        read_only=False,
+    )
+    free = Tool(
+        name="Free",
+        path=Path("/root/compatibilitytools.d/Free"),
+        root=Path("/root"),
+        read_only=False,
+    )
+    model.set_items([system, managed, used, free], {str(used.path): [7]}, {})
+    for row in range(3):
+        assert (
+            model.data(model.index(row, _TOOL_CHECK_COLUMN), Qt.ItemDataRole.CheckStateRole) is None
+        )
+    assert model.data(model.index(3, _TOOL_CHECK_COLUMN), Qt.ItemDataRole.CheckStateRole) == int(
+        Qt.CheckState.Unchecked.value
+    )
+    reasons = [
+        model.data(model.index(row, _TOOL_CHECK_COLUMN), Qt.ItemDataRole.ToolTipRole)
+        for row in range(3)
+    ]
+    assert "package manager" in reasons[0]
+    assert "Steam" in reasons[1]
+    assert "In use" in reasons[2]
+    for reason in reasons:
+        assert "<b>" in reason
+        assert reason.endswith("<b>It cannot be removed from this app.</b>")
+    assert model.data(model.index(3, _TOOL_CHECK_COLUMN), Qt.ItemDataRole.ToolTipRole) is None
+
+
+def test_locked_check_cell_shows_info_glyph(qtbot) -> None:
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QIcon
+
+    from core.tools import Tool
+    from ui.main_window import (
+        _TOOL_CHECK_COLUMN,
+        SYSTEM_TOOLS_DIR,
+        ToolTableModel,
+    )
+
+    qtbot.wait(1)  # QApplication must exist for style icons.
+    model = ToolTableModel()
+    system = Tool(
+        name="Sys",
+        path=SYSTEM_TOOLS_DIR / "Sys",
+        root=SYSTEM_TOOLS_DIR,
+        read_only=True,
+    )
+    free = Tool(
+        name="Free",
+        path=Path("/root/compatibilitytools.d/Free"),
+        root=Path("/root"),
+        read_only=False,
+    )
+    model.set_items([system, free], {}, {})
+    glyph = model.data(model.index(0, _TOOL_CHECK_COLUMN), Qt.ItemDataRole.DecorationRole)
+    assert isinstance(glyph, QIcon)
+    assert not glyph.isNull()
+    hover = model.data(model.index(0, _TOOL_CHECK_COLUMN), Qt.ItemDataRole.ToolTipRole)
+    assert "<b>It cannot be removed from this app.</b>" in hover
+    assert model.data(model.index(1, _TOOL_CHECK_COLUMN), Qt.ItemDataRole.DecorationRole) is None
+
+
+def test_both_search_bars_use_search_frame(qtbot, isolated_env: Path) -> None:
+    from PySide6.QtWidgets import QFrame
+
+    from ui.styles import STYLESHEET
+
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    prefix_frame = window._search_box.parent()
+    assert isinstance(prefix_frame, QFrame)
+    assert prefix_frame.objectName() == "searchFrame"
+    tools_frame = window._tools_search_box.parent()
+    assert isinstance(tools_frame, QFrame)
+    assert tools_frame.objectName() == "toolsSearchFrame"
+    assert tools_frame is not prefix_frame
+    assert "QFrame#searchFrame" in STYLESHEET
+    assert "QFrame#toolsSearchFrame" in STYLESHEET
+
+
+def _tools_fixture(qtbot, isolated_env: Path):
+    """Window with three custom tools, one selected by game 700."""
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    result, prefixes = _synthetic_payload(isolated_env, app_ids=(700,))
+    root = result.roots[0].path
+    for dirname in ("AlphaBuild", "BetaBuild", "GammaBuild"):
+        (root / "compatibilitytools.d" / dirname).mkdir(parents=True)
+    config_dir = root / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "config.vdf").write_text(
+        '"CompatToolMapping"\n{\n"700" "BetaBuild"\n}\n', encoding="utf-8"
+    )
+    window._on_discovery_finished((result, prefixes), window._epoch)
+    return window
+
+
+def test_tools_search_narrows_by_name(qtbot, isolated_env: Path) -> None:
+    window = _tools_fixture(qtbot, isolated_env)
+    assert sorted(tool.name for tool in window._tools_model.rows()) == [
+        "AlphaBuild",
+        "BetaBuild",
+        "GammaBuild",
+    ]
+    window._tools_search_box.setText("alp")
+    window._tools_search_timer.timeout.emit()
+    assert [tool.name for tool in window._tools_model.rows()] == ["AlphaBuild"]
+    window._tools_search_box.setText("BUILD")
+    window._tools_search_timer.timeout.emit()
+    assert sorted(tool.name for tool in window._tools_model.rows()) == [
+        "AlphaBuild",
+        "BetaBuild",
+        "GammaBuild",
+    ]
+    window._tools_search_box.setText("zzz-no-match")
+    window._tools_search_timer.timeout.emit()
+    assert window._tools_model.rows() == []
+
+
+def test_tools_status_filter_combinations(qtbot, isolated_env: Path) -> None:
+    window = _tools_fixture(qtbot, isolated_env)
+    assert window._tools_status_button.text() == "Filters"
+    window._tools_status_actions["Used"].setChecked(False)
+    assert sorted(tool.name for tool in window._tools_model.rows()) == [
+        "AlphaBuild",
+        "GammaBuild",
+    ]
+    window._tools_status_actions["Unused"].setChecked(False)
+    assert window._tools_model.rows() == []
+    window._tools_status_actions["Used"].setChecked(True)
+    assert [tool.name for tool in window._tools_model.rows()] == ["BetaBuild"]
+    assert window._tools_status_button.toolTip() == "Status: Used + Read-only"
+
+
+def test_tools_sort_orders(qtbot, isolated_env: Path) -> None:
+    from core.tools import Tool
+
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    tools = [
+        Tool(
+            name=name,
+            path=isolated_env / name,
+            root=isolated_env,
+            read_only=False,
+            size_bytes=size,
+        )
+        for name, size in (
+            ("Bravo", 100),
+            ("Alpha", 300),
+            ("Charlie", 200),
+        )
+    ]
+    window._tools_model.set_items(tools, {}, {})
+    window._all_tools = list(tools)
+    window._apply_tools_filter()
+    assert [tool.name for tool in window._tools_model.rows()] == [
+        "Alpha",
+        "Bravo",
+        "Charlie",
+    ]
+    window._on_tools_section_clicked(_TOOL_SIZE_COLUMN)
+    assert [tool.name for tool in window._tools_model.rows()] == [
+        "Alpha",
+        "Charlie",
+        "Bravo",
+    ]
+    window._on_tools_section_clicked(_TOOL_SIZE_COLUMN)
+    assert [tool.name for tool in window._tools_model.rows()] == [
+        "Bravo",
+        "Charlie",
+        "Alpha",
+    ]
+    window._on_tools_section_clicked(_TOOL_STATUS_COLUMN)
+    assert [tool.name for tool in window._tools_model.rows()] == [
+        "Bravo",
+        "Alpha",
+        "Charlie",
+    ]
+
+
+def test_tools_header_selects_only_deletable(qtbot, isolated_env: Path) -> None:
+    from PySide6.QtCore import Qt
+
+    from core.tools import Tool
+
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    tools = [
+        Tool(
+            name="Used",
+            path=isolated_env / "Used",
+            root=isolated_env,
+            read_only=False,
+        ),
+        Tool(
+            name="FreeOne",
+            path=isolated_env / "FreeOne",
+            root=isolated_env,
+            read_only=False,
+        ),
+        Tool(
+            name="FreeTwo",
+            path=isolated_env / "FreeTwo",
+            root=isolated_env,
+            read_only=False,
+        ),
+    ]
+    used_path = str(tools[0].path)
+    window._tools_model.set_items(tools, {used_path: [700]}, {})
+    window._all_tools = list(tools)
+    window._apply_tools_filter()
+    box = window._tools_header_checkbox
+    assert box.checkState() is Qt.CheckState.Unchecked
+    box.click()
+    selected = window._tools_model.selected_tools()
+    assert sorted(tool.name for tool in selected) == ["FreeOne", "FreeTwo"]
+    assert window._delete_tools_button.text() == "Delete Tools (2)"
+    assert box.checkState() is Qt.CheckState.Checked
+    box.click()
+    assert window._tools_model.selected_tools() == []
+    assert window._delete_tools_button.text() == "Delete Tools (0)"
+    assert box.checkState() is Qt.CheckState.Unchecked
+    window._tools_model.setData(
+        window._tools_model.index(1, _TOOL_CHECK_COLUMN),
+        int(Qt.CheckState.Checked.value),
+        Qt.ItemDataRole.CheckStateRole,
+    )
+    assert box.checkState() is Qt.CheckState.PartiallyChecked
+
+
+def test_tools_table_shares_prefix_view_settings(qtbot, isolated_env: Path) -> None:
+    from PySide6.QtWidgets import QHeaderView, QTableView
+
+    from ui.styles import MIN_HEADER_SECTION_PX
+
+    window = _tools_fixture(qtbot, isolated_env)
+    window.show()
+    qtbot.waitExposed(window)
+    for view in (window._table, window._tools_table):
+        assert view.alternatingRowColors() is True
+        assert view.verticalHeader().isVisible() is False
+        assert view.selectionMode() is QTableView.SelectionMode.NoSelection
+        assert view.textElideMode() is Qt.TextElideMode.ElideMiddle
+        header = view.horizontalHeader()
+        assert header.isSortIndicatorShown() is True
+        assert header.minimumSectionSize() == MIN_HEADER_SECTION_PX
+    tools_header = window._tools_table.horizontalHeader()
+    assert tools_header.sectionResizeMode(_TOOL_CHECK_COLUMN) is QHeaderView.ResizeMode.Fixed
+    assert tools_header.sectionResizeMode(_TOOL_NAME_COLUMN) is QHeaderView.ResizeMode.Stretch
+    window._set_page(_PAGE_TOOLS)
+    assert window._tabs.currentIndex() == _PAGE_TOOLS
+    assert window._tools_table.isVisible()
+    window._set_page(_PAGE_PREFIXES)
+    assert window._tabs.currentIndex() == _PAGE_PREFIXES
+
+
+def _sized_tool(name: str, base: Path, size: int = 0) -> Tool:
+    from core.tools import Tool
+
+    return Tool(name=name, path=base / name, root=base, read_only=False, size_bytes=size)
+
+
+def test_hidden_row_size_resolves_on_reshow(qtbot, isolated_env: Path) -> None:
+    from PySide6.QtCore import Qt
+
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    alpha = _sized_tool("Alpha", isolated_env)
+    beta = _sized_tool("Beta", isolated_env)
+    window._tools_model.set_items([alpha, beta], {}, {})
+    window._all_tools = [alpha, beta]
+    window._apply_tools_filter()
+    window._tools_search_box.setText("alpha")
+    window._tools_search_timer.timeout.emit()
+    assert [tool.name for tool in window._tools_model.rows()] == ["Alpha"]
+    window._on_tool_sized((str(beta.path), 64, None), window._epoch)
+    window._tools_search_box.setText("")
+    window._tools_search_timer.timeout.emit()
+    assert [tool.name for tool in window._tools_model.rows()] == ["Alpha", "Beta"]
+    assert str(beta.path) not in window._tools_model.pending
+    size = window._tools_model.data(
+        window._tools_model.index(1, _TOOL_SIZE_COLUMN), Qt.ItemDataRole.DisplayRole
+    )
+    assert size == "64 B"
+
+
+def test_hidden_selection_cleared_on_filter(qtbot, isolated_env: Path) -> None:
+    from PySide6.QtCore import Qt
+
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    alpha = _sized_tool("Alpha", isolated_env)
+    beta = _sized_tool("Beta", isolated_env)
+    window._tools_model.set_items([alpha, beta], {}, {})
+    window._all_tools = [alpha, beta]
+    window._apply_tools_filter()
+    index = window._tools_model.index(1, _TOOL_CHECK_COLUMN)
+    assert window._tools_model.setData(
+        index, int(Qt.CheckState.Checked.value), Qt.ItemDataRole.CheckStateRole
+    )
+    assert window._delete_tools_button.text() == "Delete Tools (1)"
+    window._tools_search_box.setText("alpha")
+    window._tools_search_timer.timeout.emit()
+    assert window._tools_model.selected_tools() == []
+    assert window._delete_tools_button.text() == "Delete Tools (0)"
+    window._tools_search_box.setText("")
+    window._tools_search_timer.timeout.emit()
+    assert window._tools_model.selected_tools() == []
+    assert window._delete_tools_button.text() == "Delete Tools (0)"
+
+
+def test_system_lock_reason_with_symlinked_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from PySide6.QtCore import Qt
+
+    from core.tools import Tool
+    from ui.main_window import ToolTableModel
+
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    tool = Tool(name="Build", path=(link / "Build").resolve(), root=link, read_only=True)
+    monkeypatch.setattr("ui.main_window.SYSTEM_TOOLS_DIR", link)
+    model = ToolTableModel()
+    model.set_items([tool], {}, {})
+    reason = model.data(model.index(0, _TOOL_CHECK_COLUMN), Qt.ItemDataRole.ToolTipRole)
+    assert "package manager" in reason
+
+
+def test_removed_tool_shows_unavailable(tmp_path: Path) -> None:
+    from PySide6.QtCore import Qt
+
+    from core.tools import Tool
+    from ui.main_window import ToolTableModel
+    from ui.workers import ToolSizeWorker
+
+    tool = Tool(name="Gone", path=tmp_path / "Gone", root=tmp_path, read_only=False)
+    worker = ToolSizeWorker([tool], 0)
+    payloads: list[object] = []
+    worker.signals.sized.connect(lambda payload, epoch: payloads.append(payload))
+    worker.run()
+    assert len(payloads) == 1
+    payload = payloads[0]
+    assert isinstance(payload, tuple) and payload[2] is not None
+    model = ToolTableModel()
+    model.set_items([tool], {}, {})
+    model.set_tool_size(str(tool.path), 0, payload[2])
+    assert model.pending == set()
+    assert (
+        model.data(model.index(0, _TOOL_SIZE_COLUMN), Qt.ItemDataRole.DisplayRole) == "Unavailable"
+    )
+
+
+def test_used_readonly_row_matches_either_facet(qtbot, isolated_env: Path) -> None:
+    from core.tools import Tool
+
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    managed = Tool(
+        name="Proton 9.0",
+        path=isolated_env / "Proton 9.0",
+        root=isolated_env,
+        read_only=True,
+    )
+    window._tools_model.set_items([managed], {str(managed.path): [700]}, {700: "Game"})
+    window._all_tools = [managed]
+    window._apply_tools_filter()
+    assert [tool.name for tool in window._tools_model.rows()] == ["Proton 9.0"]
+    window._tools_status_actions["Unused"].setChecked(False)
+    window._tools_status_actions["Read-only"].setChecked(False)
+    assert [tool.name for tool in window._tools_model.rows()] == ["Proton 9.0"]
+    window._tools_status_actions["Used"].setChecked(False)
+    window._tools_status_actions["Read-only"].setChecked(True)
+    assert [tool.name for tool in window._tools_model.rows()] == ["Proton 9.0"]
+    window._tools_status_actions["Read-only"].setChecked(False)
+    window._tools_status_actions["Unused"].setChecked(True)
+    assert window._tools_model.rows() == []
+
+
+def test_tools_selection_gates_delete_button(qtbot, isolated_env: Path) -> None:
+    from PySide6.QtCore import Qt
+
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    result, prefixes = _synthetic_payload(isolated_env, app_ids=(700,))
+    root = result.roots[0].path
+    used_dir = root / "compatibilitytools.d" / "UsedBuild"
+    used_dir.mkdir(parents=True)
+    free_dir = root / "compatibilitytools.d" / "FreeBuild"
+    free_dir.mkdir(parents=True)
+    config_dir = root / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "config.vdf").write_text(
+        '"CompatToolMapping"\n{\n"700" "UsedBuild"\n}\n', encoding="utf-8"
+    )
+    window._on_discovery_finished((result, prefixes), window._epoch)
+    model = window._tools_model
+    rows = {tool.name: row for row, tool in enumerate(model._tools)}
+    used_index = model.index(rows["UsedBuild"], _TOOL_CHECK_COLUMN)
+    assert not (model.flags(used_index) & Qt.ItemFlag.ItemIsUserCheckable)
+    assert model.setData(used_index, Qt.CheckState.Checked, Qt.ItemDataRole.CheckStateRole) is False
+    free_index = model.index(rows["FreeBuild"], _TOOL_CHECK_COLUMN)
+    assert model.flags(free_index) & Qt.ItemFlag.ItemIsUserCheckable
+    assert model.setData(free_index, Qt.CheckState.Checked, Qt.ItemDataRole.CheckStateRole) is True
+    assert window._delete_tools_button.text() == "Delete Tools (1)"
+    assert window._delete_tools_button.isEnabled()
+    assert (
+        model.setData(free_index, Qt.CheckState.Unchecked, Qt.ItemDataRole.CheckStateRole) is True
+    )
+    assert window._delete_tools_button.text() == "Delete Tools (0)"
+    assert not window._delete_tools_button.isEnabled()
 
 
 def test_filter_and_action_bars_only_visible_on_prefixes_page(qtbot, isolated_env: Path) -> None:
@@ -951,3 +1524,66 @@ def test_accepted_font_change_resolves_children_immediately(
         assert window._message_label.font().pointSize() == 14
     finally:
         QApplication.setFont(original_font)
+
+
+@pytest.fixture()
+def tools_deletion_setup(qtbot, isolated_env: Path, monkeypatch: pytest.MonkeyPatch):
+    """Window with one deletable tool plus mocked dialog and trash plumbing."""
+    from core import deletion as deletion_module
+    from core.deletion import DeleteMode
+
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    result, prefixes = _synthetic_payload(isolated_env, app_ids=(700,))
+    root = result.roots[0].path
+    target = root / "compatibilitytools.d" / "OldBuild"
+    target.mkdir(parents=True)
+    (target / "payload.bin").write_bytes(b"x" * 32)
+    window._on_discovery_finished((result, prefixes), window._epoch)
+    assert [tool.name for tool in window._tools_model.rows()] == ["OldBuild"]
+
+    calls: list[Path] = []
+
+    def fake_send2trash(path: Path) -> None:
+        calls.append(path)
+
+    monkeypatch.setattr(deletion_module, "send2trash", fake_send2trash)
+
+    dialog_calls: list[str] = []
+    monkeypatch.setattr(
+        "ui.main_window.confirm_selection",
+        lambda parent, names, total, note, item_noun="prefixes": (
+            dialog_calls.append("selection") or True
+        ),
+    )
+    monkeypatch.setattr(
+        "ui.main_window.confirm_final",
+        lambda parent, count, size, item_noun="prefix(es)": (
+            dialog_calls.append("final") or DeleteMode.TRASH
+        ),
+    )
+    summaries: list[object] = []
+    monkeypatch.setattr(
+        "ui.main_window.show_deletion_summary", lambda parent, results: summaries.append(results)
+    )
+    return window, target, calls, dialog_calls, summaries
+
+
+def test_tools_delete_runs_off_thread_then_refreshes(qtbot, tools_deletion_setup) -> None:
+    from PySide6.QtCore import Qt
+
+    window, target, calls, dialog_calls, summaries = tools_deletion_setup
+    initial_epoch = window._epoch
+    index = window._tools_model.index(0, _TOOL_CHECK_COLUMN)
+    assert window._tools_model.setData(
+        index, int(Qt.CheckState.Checked.value), Qt.ItemDataRole.CheckStateRole
+    )
+    window._on_delete_tools_clicked()
+    assert window._tools_deleting is True
+    assert window._delete_tools_button.isEnabled() is False
+    qtbot.waitUntil(lambda: not window._tools_deleting, timeout=15000)
+    qtbot.waitUntil(lambda: window._epoch > initial_epoch, timeout=15000)
+    qtbot.waitUntil(lambda: window._tools_model.rows() == [], timeout=15000)
+    assert calls == [target.resolve(strict=False)]
+    assert dialog_calls == ["selection", "final"]
+    assert summaries == []

@@ -12,12 +12,13 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, Signal
 
-from core.deletion import DeleteMode, delete_prefixes
-from core.discovery import Library, discover
+from core.deletion import DeleteMode, delete_prefixes, delete_tools
+from core.discovery import Library, SteamRoot, discover
 from core.enumeration import enumerate_from_discovery
 from core.models import Prefix
 from core.opener import open_folder
-from core.scanner import scan_prefixes
+from core.scanner import scan_prefix, scan_prefixes
+from core.tools import Tool
 
 
 class DiscoverySignals(QObject):
@@ -107,3 +108,52 @@ class OpenFolderWorker(QRunnable):
 
     def run(self) -> None:
         self.signals.finished.emit(open_folder(self._path))
+
+
+class ToolSizeSignals(QObject):
+    sized = Signal(object, int)
+    finished = Signal(int)
+
+
+class ToolSizeWorker(QRunnable):
+    """Walks each tool directory and reports one event per tool."""
+
+    def __init__(self, tools: Sequence[Tool], epoch: int) -> None:
+        super().__init__()
+        self._tools = list(tools)
+        self.epoch = epoch
+        self.signals = ToolSizeSignals()
+
+    def run(self) -> None:
+        for tool in self._tools:
+            result = scan_prefix(tool.path)
+            self.signals.sized.emit((str(tool.path), result.size_bytes, result.error), self.epoch)
+        self.signals.finished.emit(self.epoch)
+
+
+class ToolDeletionSignals(QObject):
+    result_ready = Signal(object, int)
+    finished = Signal(int)
+
+
+class ToolDeletionWorker(QRunnable):
+    """Runs delete_tools and streams one event per target."""
+
+    def __init__(
+        self,
+        tools: Sequence[Tool],
+        roots: Sequence[SteamRoot | Path],
+        mode: DeleteMode,
+        epoch: int,
+    ) -> None:
+        super().__init__()
+        self._tools = list(tools)
+        self._roots = list(roots)
+        self._mode = mode
+        self.epoch = epoch
+        self.signals = ToolDeletionSignals()
+
+    def run(self) -> None:
+        for result in delete_tools(self._tools, self._roots, self._mode):
+            self.signals.result_ready.emit(result, self.epoch)
+        self.signals.finished.emit(self.epoch)
