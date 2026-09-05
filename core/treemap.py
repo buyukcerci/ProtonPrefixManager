@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import Generic, TypeVar
 
 K = TypeVar("K")
 
@@ -20,6 +20,13 @@ class CellRect:
     y: float
     w: float
     h: float
+
+
+@dataclass(slots=True)
+class SizedLayout(Generic[K]):
+    cells: list[tuple[K, CellRect]]
+    folded_keys: list[K]
+    folded_value: float
 
 
 def layout(items: Sequence[tuple[K, float]], area: CellRect) -> list[tuple[K, CellRect]]:
@@ -39,6 +46,49 @@ def layout(items: Sequence[tuple[K, float]], area: CellRect) -> list[tuple[K, Ce
     out: list[tuple[K, CellRect]] = []
     _squarify([(key, value * scale) for key, value in entries], area, out)
     return out
+
+
+def layout_sized(
+    items: Sequence[tuple[K, float]],
+    area: CellRect,
+    min_height: float,
+    exempt_key: K | None = None,
+) -> SizedLayout[K]:
+    """Squarified layout that folds cells shorter than min_height.
+
+    The function lays the items out, folds every cell whose height is
+    below min_height, and lays the remaining items out again with the
+    folded value added to the exempt key's value. Fold and relayout
+    repeat until no remaining cell is below min_height or nothing is
+    left to fold. The exempt key, when present among the items, is never
+    folded, so its cell may stay below min_height and its area already
+    absorbs the folded value. Keys must be unique and hashable. The
+    result carries the folded keys and their summed value in
+    folded_value so callers can account for the overflow elsewhere. Zero
+    and negative values are skipped as in layout, and the result is a
+    pure function of the inputs.
+    """
+    entries = [(key, float(value)) for key, value in items if value > 0]
+    if not entries or area.w <= 0 or area.h <= 0:
+        return SizedLayout(cells=[], folded_keys=[], folded_value=0.0)
+    remaining = list(entries)
+    folded: list[K] = []
+    folded_value = 0.0
+    while True:
+        cells = layout(remaining, area)
+        foldable = [key for key, cell in cells if cell.h < min_height and key != exempt_key]
+        if not foldable:
+            break
+        folded.extend(foldable)
+        fold_set = set(foldable)
+        overflow = sum(value for key, value in remaining if key in fold_set)
+        folded_value += overflow
+        remaining = [(key, value) for key, value in remaining if key not in fold_set]
+        if exempt_key is not None:
+            remaining = [
+                (key, value + overflow if key == exempt_key else value) for key, value in remaining
+            ]
+    return SizedLayout(cells=cells, folded_keys=folded, folded_value=folded_value)
 
 
 def _squarify(items: list[tuple[K, float]], area: CellRect, out: list[tuple[K, CellRect]]) -> None:

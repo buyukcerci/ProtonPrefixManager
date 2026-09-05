@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 from collections.abc import Sequence
 
-from core.treemap import CellRect, layout
+from core.treemap import CellRect, layout, layout_sized
 
 AREA_TOLERANCE = 0.02  # areas proportional to values within 2 percent relative
 EPSILON = 1e-6
@@ -172,3 +172,76 @@ def test_layout_matches_recursive_reference_geometry() -> None:
         for mine, reference in zip(actual, expected, strict=True):
             for field in ("x", "y", "w", "h"):
                 assert abs(getattr(mine, field) - getattr(reference, field)) < 1e-9
+
+
+# --- min height folding -------------------------------------------------------
+
+
+def test_sized_layout_cells_meet_min_height_when_possible() -> None:
+    area = CellRect(x=0, y=0, w=600, h=80)
+    items = [(index, float(value)) for index, value in enumerate([500, 400, 300, 2, 1])]
+    result = layout_sized(items, area, 20.0, exempt_key=-1)
+    assert result.cells
+    for key, cell in result.cells:
+        if key == -1:
+            continue
+        assert cell.h >= 20.0 - EPSILON
+    covered = sum(cell.w * cell.h for _, cell in result.cells)
+    assert abs(covered - area.w * area.h) <= area.w * area.h * AREA_TOLERANCE
+
+
+def test_sized_layout_folds_small_cells_into_exempt_value() -> None:
+    area = CellRect(x=0, y=0, w=400, h=100)
+    items = [("big", 900.0), ("tiny1", 1.0), ("tiny2", 1.0)]
+    result = layout_sized(items, area, 30.0, exempt_key="big")
+    assert result.folded_keys == ["tiny1", "tiny2"]
+    assert abs(result.folded_value - 2.0) <= EPSILON
+    assert [key for key, _ in result.cells] == ["big"]
+    big_cell = result.cells[0][1]
+    assert abs(_area(big_cell) - area.w * area.h) <= EPSILON
+
+
+def test_sized_layout_without_exempt_folds_everything() -> None:
+    area = CellRect(x=0, y=0, w=100, h=10)
+    result = layout_sized([("a", 5.0), ("b", 5.0)], area, 20.0)
+    assert result.cells == []
+    assert result.folded_keys == ["a", "b"]
+    assert abs(result.folded_value - 10.0) <= EPSILON
+
+
+def test_sized_layout_exempt_cell_is_never_folded() -> None:
+    area = CellRect(x=0, y=0, w=100, h=40)
+    result = layout_sized([("disk", 1.0)], area, 50.0, exempt_key="disk")
+    assert [key for key, _ in result.cells] == ["disk"]
+    assert result.folded_keys == []
+    assert result.folded_value == 0.0
+
+
+def test_sized_layout_is_deterministic() -> None:
+    area = CellRect(x=2.0, y=3.0, w=320.0, h=200.0)
+    items = [(index, float((index * 7919) % 500 + 1)) for index in range(30)]
+    first = layout_sized(items, area, 18.0, exempt_key=-1)
+    second = layout_sized(items, area, 18.0, exempt_key=-1)
+    assert first == second
+
+
+def test_sized_layout_min_height_taller_than_area_folds_all_but_exempt() -> None:
+    area = CellRect(x=0, y=0, w=200, h=30)
+    items = [("disk", 700.0), ("a", 200.0), ("b", 100.0)]
+    result = layout_sized(items, area, 60.0, exempt_key="disk")
+    assert [key for key, _ in result.cells] == ["disk"]
+    assert set(result.folded_keys) == {"a", "b"}
+    assert abs(result.folded_value - 300.0) <= EPSILON
+    disk_cell = result.cells[0][1]
+    assert abs(_area(disk_cell) - area.w * area.h) <= EPSILON
+
+
+def test_sized_layout_degenerate_inputs_and_zero_min_height() -> None:
+    area = CellRect(x=0, y=0, w=100, h=100)
+    empty = layout_sized([], area, 10.0)
+    assert empty.cells == []
+    assert empty.folded_keys == []
+    assert empty.folded_value == 0.0
+    assert layout_sized([("a", 10.0)], CellRect(x=0, y=0, w=100, h=0), 10.0).cells == []
+    plain = layout([("a", 1.0), ("b", 2.0)], area)
+    assert layout_sized([("a", 1.0), ("b", 2.0)], area, 0.0).cells == plain
