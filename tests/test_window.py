@@ -20,8 +20,12 @@ from core.models import Prefix, PrefixType, ScanStatus, format_size, prefix_key
 from core.scanner import ScanEvent, ScanEventKind, save_cached
 from core.tools import Tool
 from ui.main_window import (
+    _INNER_PAGE_MESSAGE,
+    _INNER_PAGE_TABLE,
     _NO_PREFIXES_TEXT,
     _NO_ROWS_TEXT,
+    _NO_TOOLS_INSTALLED_TEXT,
+    _NO_TOOLS_ROWS_TEXT,
     _PAGE_OVERVIEW,
     _PAGE_PREFIXES,
     _PAGE_TOOLS,
@@ -1011,6 +1015,30 @@ def test_tools_search_narrows_by_name(qtbot, isolated_env: Path) -> None:
     assert window._tools_model.rows() == []
 
 
+def test_tools_tab_shows_installed_empty_state(qtbot, isolated_env: Path) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    result, prefixes = _synthetic_payload(isolated_env, app_ids=(700,))
+    window._on_discovery_finished((result, prefixes), window._epoch)
+    assert window._all_tools == []
+    assert window._tools_stack.currentIndex() == _INNER_PAGE_MESSAGE
+    assert window._tools_message_label.text() == _NO_TOOLS_INSTALLED_TEXT
+
+
+def test_tools_tab_shows_filter_empty_state_and_recovers(qtbot, isolated_env: Path) -> None:
+    window = _tools_fixture(qtbot, isolated_env)
+    assert window._tools_stack.currentIndex() == _INNER_PAGE_TABLE
+    window._tools_search_box.setText("zzz-no-match")
+    window._tools_search_timer.timeout.emit()
+    assert window._tools_model.rows() == []
+    assert window._tools_stack.currentIndex() == _INNER_PAGE_MESSAGE
+    assert window._tools_message_label.text() == _NO_TOOLS_ROWS_TEXT
+    window._tools_search_box.setText("")
+    window._tools_search_timer.timeout.emit()
+    assert len(window._tools_model.rows()) == 3
+    assert window._tools_stack.currentIndex() == _INNER_PAGE_TABLE
+
+
 def test_tools_status_filter_combinations(qtbot, isolated_env: Path) -> None:
     window = _tools_fixture(qtbot, isolated_env)
     assert window._tools_status_button.text() == "Filters"
@@ -1021,8 +1049,11 @@ def test_tools_status_filter_combinations(qtbot, isolated_env: Path) -> None:
     ]
     window._tools_status_actions["Unused"].setChecked(False)
     assert window._tools_model.rows() == []
+    assert window._tools_stack.currentIndex() == _INNER_PAGE_MESSAGE
+    assert window._tools_message_label.text() == _NO_TOOLS_ROWS_TEXT
     window._tools_status_actions["Used"].setChecked(True)
     assert [tool.name for tool in window._tools_model.rows()] == ["BetaBuild"]
+    assert window._tools_stack.currentIndex() == _INNER_PAGE_TABLE
     assert window._tools_status_button.toolTip() == "Status: Used + Read-only + Unknown"
 
 

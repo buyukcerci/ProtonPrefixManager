@@ -133,6 +133,7 @@ _NO_ROOTS_TEXT = (
 _NO_PREFIXES_TEXT = "Steam libraries were found, but no Proton prefixes exist yet."
 _NO_ROWS_TEXT = "No prefixes match the current view."
 _NO_TOOLS_ROWS_TEXT = "No tools match the current view."
+_NO_TOOLS_INSTALLED_TEXT = "No Proton tools installed."
 
 _SCAN_WAIT_MS = 2000
 _WARNING_TOOLTIP_MAX_LINES = 20
@@ -207,6 +208,14 @@ def _tool_facets(tool: Tool, used: set[str], *, usage_known: bool) -> set[str]:
         unknown = not usage_known or tool.name_unverified
         facets.add(_TOOL_STATUS_UNKNOWN if unknown else _TOOL_STATUS_UNUSED)
     return facets
+
+
+def _set_message_content(icon_label: QLabel, text_label: QLabel, text: str) -> None:
+    """Set message text plus the shared information icon."""
+    text_label.setText(text)
+    if QApplication.instance() is not None:
+        icon = QApplication.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation)
+        icon_label.setPixmap(icon.pixmap(MESSAGE_ICON_SIZE_PX, MESSAGE_ICON_SIZE_PX))
 
 
 class ToolTableModel(QAbstractTableModel):
@@ -816,9 +825,32 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self._build_tools_filter_bar(page))
         self._tools_table = QTableView(page)
         self._tools_table.setModel(self._tools_model)
+        self._tools_message_icon_label = QLabel(page)
+        self._tools_message_icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._tools_message_icon_label.setFixedSize(MESSAGE_ICON_SIZE_PX, MESSAGE_ICON_SIZE_PX)
+        self._tools_message_label = QLabel(page)
+        self._tools_message_label.setWordWrap(True)
+        self._tools_message_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._tools_message_page = QWidget(page)
+        tools_message_layout = QVBoxLayout(self._tools_message_page)
+        tools_message_layout.setContentsMargins(
+            MESSAGE_PAGE_MARGIN_PX,
+            MESSAGE_PAGE_MARGIN_PX,
+            MESSAGE_PAGE_MARGIN_PX,
+            MESSAGE_PAGE_MARGIN_PX,
+        )
+        tools_message_layout.setSpacing(MESSAGE_LAYOUT_SPACING_PX)
+        tools_message_layout.addStretch(1)
+        tools_message_layout.addWidget(
+            self._tools_message_icon_label, alignment=Qt.AlignmentFlag.AlignHCenter
+        )
+        tools_message_layout.addWidget(self._tools_message_label)
+        tools_message_layout.addStretch(1)
+        self._tools_stack = QStackedWidget(page)
+        self._tools_stack.addWidget(self._tools_message_page)
+        self._tools_stack.addWidget(self._tools_table)
         header = shared_view_settings(self._tools_table)
         header.setSectionResizeMode(_TOOL_CHECK_COLUMN, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(_TOOL_NAME_COLUMN, QHeaderView.ResizeMode.Stretch)
@@ -832,8 +864,10 @@ class MainWindow(QMainWindow):
         self._tools_header_checkbox.clicked.connect(self._on_tools_header_toggle)
         header.geometriesChanged.connect(self._reposition_tools_header_checkbox)
         self._tools_model.selection_changed.connect(self._on_tools_selection_changed)
-        layout.addWidget(self._tools_table)
+        layout.addWidget(self._build_tools_filter_bar(page))
+        layout.addWidget(self._tools_stack)
         layout.addWidget(self._build_tools_action_bar(page))
+        self._tools_stack.setCurrentIndex(_INNER_PAGE_TABLE)
         return page
 
     def _build_tools_filter_bar(self, parent: QWidget) -> QWidget:
@@ -986,10 +1020,14 @@ class MainWindow(QMainWindow):
         else:
             visible.sort(key=lambda tool: tool.name.casefold(), reverse=self._tools_sort_descending)
         self._tools_model.set_visible(visible)
-        if not visible and self._all_tools:
-            self._status.showMessage(_NO_TOOLS_ROWS_TEXT, 5000)
-        elif self._status.currentMessage() == _NO_TOOLS_ROWS_TEXT:
-            self._status.clearMessage()
+        if visible:
+            self._tools_stack.setCurrentIndex(_INNER_PAGE_TABLE)
+        elif self._all_tools:
+            self._show_tools_message(_NO_TOOLS_ROWS_TEXT)
+            self._tools_stack.setCurrentIndex(_INNER_PAGE_MESSAGE)
+        else:
+            self._show_tools_message(_NO_TOOLS_INSTALLED_TEXT)
+            self._tools_stack.setCurrentIndex(_INNER_PAGE_MESSAGE)
 
     def _on_tools_section_clicked(self, section: int) -> None:
         key = _TOOL_SORTABLE_COLUMNS.get(section)
@@ -1656,24 +1694,17 @@ class MainWindow(QMainWindow):
         header.setSortIndicator(section, order)
 
     def _show_message(self, text: str, *, locate: bool = False) -> None:
-        self._message_label.setText(text)
+        _set_message_content(self._message_icon_label, self._message_label, text)
         self._locate_button.setVisible(locate)
         if locate:
             self._locate_button.setFocus()
-        if QApplication.instance() is not None:
-            icon = QApplication.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation)
-            self._message_icon_label.setPixmap(
-                icon.pixmap(MESSAGE_ICON_SIZE_PX, MESSAGE_ICON_SIZE_PX)
-            )
         self._stack.setCurrentIndex(_PAGE_MESSAGE)
 
     def _show_inner_message(self, text: str) -> None:
-        self._inner_message_label.setText(text)
-        if QApplication.instance() is not None:
-            icon = QApplication.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation)
-            self._inner_message_icon_label.setPixmap(
-                icon.pixmap(MESSAGE_ICON_SIZE_PX, MESSAGE_ICON_SIZE_PX)
-            )
+        _set_message_content(self._inner_message_icon_label, self._inner_message_label, text)
+
+    def _show_tools_message(self, text: str) -> None:
+        _set_message_content(self._tools_message_icon_label, self._tools_message_label, text)
 
     def _update_progress_text(self) -> None:
         if self._scan_total <= 0:
