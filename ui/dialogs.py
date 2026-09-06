@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -26,6 +27,7 @@ from core.deletion import (
 )
 from core.models import Prefix, ScanStatus
 from core.tools import Tool
+from ui.sanitize import sanitize_display
 
 MAX_LISTED_NAMES = 8
 
@@ -42,7 +44,7 @@ def selection_body(
     pass tools for the tools tab. Count-specific singular handling stays
     out to keep the dialog API stable.
     """
-    listed = list(names[:MAX_LISTED_NAMES])
+    listed = [sanitize_display(name) for name in names[:MAX_LISTED_NAMES]]
     overflow = len(names) - len(listed)
     lines = [f"The following {item_noun} will be removed:", ""]
     lines.extend(listed)
@@ -67,6 +69,7 @@ def confirm_selection(
     dialog.setWindowTitle("Review selection")
     layout = QVBoxLayout(dialog)
     label = QLabel(selection_body(names, total_text, unscanned_note, item_noun))
+    label.setTextFormat(Qt.TextFormat.PlainText)
     label.setWordWrap(True)
     layout.addWidget(label)
     buttons = QDialogButtonBox(
@@ -103,6 +106,7 @@ def confirm_final(
         f"{count} {item_noun} totaling {size_text} will be removed.\n"
         "Choose how they should be removed:"
     )
+    warning.setTextFormat(Qt.TextFormat.PlainText)
     warning.setWordWrap(True)
     layout.addWidget(warning)
     trash_radio = QRadioButton("Move to trash (recommended)")
@@ -135,15 +139,15 @@ def summary_body(results: Sequence[DeletionResult | ToolDeletionResult]) -> str:
         for problem in problems:
             target = problem.prefix if isinstance(problem, DeletionResult) else problem.tool
             if isinstance(target, Prefix):
-                header = f"[{target.app_id}] {target.name}"
+                header = sanitize_display(f"[{target.app_id}] {target.name}")
             else:
-                header = target.name
+                header = sanitize_display(target.name)
             if problem.status is DeletionStatus.REJECTED:
                 reason = problem.reject_reason.value if problem.reject_reason else "rejected"
                 lines.append(f"  {header}: rejected ({reason})")
             else:
                 kind = problem.failure_kind.value if problem.failure_kind else "failed"
-                detail = problem.error or "no details available"
+                detail = sanitize_display(problem.error or "no details available")
                 lines.append(f"  {header}: failed ({kind}): {detail}")
     return "\n".join(lines)
 
@@ -156,6 +160,7 @@ def show_deletion_summary(
     dialog.setWindowTitle("Deletion summary")
     layout = QVBoxLayout(dialog)
     label = QLabel(summary_body(results))
+    label.setTextFormat(Qt.TextFormat.PlainText)
     label.setWordWrap(True)
     layout.addWidget(label)
     buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)

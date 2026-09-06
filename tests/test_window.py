@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFontDatabase
+from PySide6.QtGui import QFontDatabase, QPalette
 from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QWidget
 
 from core import tools as tools_module
@@ -28,8 +29,11 @@ from ui.main_window import (
     _TOOL_NAME_COLUMN,
     _TOOL_SIZE_COLUMN,
     _TOOL_STATUS_COLUMN,
+    _TOOL_STATUS_FILTERS,
+    _TOOL_STATUS_UNUSED,
     MainWindow,
 )
+from ui.sanitize import sanitize_tooltip
 from ui.settings import SettingsDialog
 from ui.styles import apply_app_style
 from ui.table import SIZE_COLUMN
@@ -55,6 +59,11 @@ def _synthetic_payload(
     compatdata = root / "steamapps" / "compatdata"
     for app_id in app_ids:
         (compatdata / str(app_id)).mkdir(parents=True, exist_ok=True)
+    # A root without any config.vdf fails the mapping load closed, so the
+    # synthetic root carries an empty mapping like a real install would.
+    config_path = root / "config" / "config.vdf"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text('"CompatToolMapping"\n{\n}\n', encoding="utf-8")
     library = Library(path=root.resolve(), root=base.resolve())
     result = DiscoveryResult(
         roots=[SteamRoot(path=root.resolve(), source=RootSource.NATIVE)],
@@ -174,11 +183,46 @@ def test_warning_count_restored_after_scan(qtbot, isolated_env: Path) -> None:
     config_path = result.roots[0].path / "config" / "config.vdf"
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_bytes(b"\xff\xfe broken")
+    from core.discovery import DiscoveryError, DiscoveryErrorKind
+
+    result.errors.append(
+        DiscoveryError(
+            kind=DiscoveryErrorKind.MISSING,
+            message="missing lib",
+            path=Path("/missing/lib"),
+        )
+    )
     window._on_discovery_finished((result, prefixes), window._epoch)
-    assert window._warning_count == 1
+    assert window._warning_count == 2
+    assert window._warning_label.text() == "2 warnings"
     assert window._status.currentMessage().startswith("Scanning sizes")
     window._on_scan_finished(window._epoch)
-    assert window._status.currentMessage() == "warnings: 1"
+    assert window._status.currentMessage() == "warnings: 2"
+
+
+def test_symlinked_tools_dir_warns_and_enumerates_nothing(qtbot, isolated_env: Path) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    result, prefixes = _synthetic_payload(isolated_env, app_ids=(700,))
+    root = result.roots[0]
+    victim = isolated_env / "victim"
+    (victim / "Planted").mkdir(parents=True)
+    (victim / "Planted" / "compatibilitytool.vdf").write_text("junk", encoding="utf-8")
+    toolsdir = root.path / "compatibilitytools.d"
+    toolsdir.symlink_to(victim, target_is_directory=True)
+    window._on_discovery_finished((result, prefixes), window._epoch)
+    # The planted content enumerates nothing and the skip feeds the same
+    # warning count as the other discovery problems.
+    assert window._tools_model.rows() == []
+    assert window._all_tools == []
+    assert window._warning_count == 1
+    assert len(window._enumeration_warnings) == 1
+    assert window._enumeration_warnings[0].path == toolsdir
+    assert not window._warning_label.isHidden()
+    assert window._warning_label.text() == "1 warning"
+    assert str(toolsdir) in window._warning_label.toolTip()
+    window.refresh()
+    assert window._warning_label.isHidden()
 
 
 def test_clean_scan_finishes_with_empty_status(qtbot, isolated_env: Path) -> None:
@@ -187,6 +231,7 @@ def test_clean_scan_finishes_with_empty_status(qtbot, isolated_env: Path) -> Non
     result, prefixes = _synthetic_payload(isolated_env, app_ids=(701,))
     window._on_discovery_finished((result, prefixes), window._epoch)
     assert window._warning_count == 0
+    assert window._warning_label.isHidden()
     assert window._status.currentMessage().startswith("Scanning sizes")
     window._on_scan_finished(window._epoch)
     assert window._status.currentMessage() == ""
@@ -679,7 +724,7 @@ def test_used_tool_tooltip_lists_games(qtbot, isolated_env: Path) -> None:
     plain = model.data(
         model.index(rows["FreeBuild"], _TOOL_NAME_COLUMN), Qt.ItemDataRole.ToolTipRole
     )
-    assert plain == str(free_dir.resolve())
+    assert plain == sanitize_tooltip(str(free_dir.resolve()))
 
 
 def test_tool_sizes_fill_after_list(qtbot, isolated_env: Path) -> None:
@@ -727,6 +772,81 @@ def test_stale_tool_size_event_dropped(qtbot, isolated_env: Path) -> None:
         window._tools_model.index(0, _TOOL_SIZE_COLUMN), Qt.ItemDataRole.DisplayRole
     )
     assert filled == "128 B"
+
+
+def test_tools_overview_refresh_is_debounced(qtbot, isolated_env: Path) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    tool = Tool(
+        name="Build",
+        path=isolated_env / "Build",
+        root=isolated_env,
+        read_only=False,
+    )
+    window._tools_model.set_items([tool], {}, {})
+    window._all_tools = [tool]  # normally filled by discovery
+    window._refresh_overview()
+    assert window._overview.tools_card.value_text() == "1"
+    assert window._overview.tools_disk_card.value_text() == "0 B"
+
+    window._on_tool_sized((str(tool.path), 128, None), window._epoch)
+    assert window._tools_overview_timer.isActive()
+    assert window._overview.tools_disk_card.value_text() == "0 B"
+
+    window.flush_tools_overview_refresh()
+    assert not window._tools_overview_timer.isActive()
+    assert window._overview.tools_disk_card.value_text() == format_size(128)
+
+
+def test_tool_highlight_expires_without_manual_clear(
+    qtbot, isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ui.main_window as main_window_module
+    from ui.main_window import ToolTableModel
+
+    monkeypatch.setattr(main_window_module, "HIGHLIGHT_DURATION_MS", 20)
+    model = ToolTableModel()
+    tool = Tool(
+        name="Build",
+        path=isolated_env / "Build",
+        root=isolated_env,
+        read_only=False,
+    )
+    model.set_items([tool], {}, {})
+    model.highlight_row(tool)
+    assert model.highlighted_path() == str(tool.path)
+    index = model.index(0, _TOOL_NAME_COLUMN)
+    brush = model.data(index, Qt.ItemDataRole.BackgroundRole)
+    assert brush is not None
+
+    qtbot.waitUntil(lambda: model.highlighted_path() is None, timeout=2000)
+    assert model.data(index, Qt.ItemDataRole.BackgroundRole) is None
+
+
+def test_set_visible_clears_highlight_and_prunes_selection(qtbot, isolated_env: Path) -> None:
+    from ui.main_window import ToolTableModel
+
+    model = ToolTableModel()
+    keep = Tool(name="Keep", path=isolated_env / "Keep", root=isolated_env, read_only=False)
+    drop = Tool(name="Drop", path=isolated_env / "Drop", root=isolated_env, read_only=False)
+    model.set_items([keep, drop], {}, {})
+    for tool in (keep, drop):
+        index = model.index(model.rows().index(tool), _TOOL_CHECK_COLUMN)
+        assert model.setData(
+            index, int(Qt.CheckState.Checked.value), Qt.ItemDataRole.CheckStateRole
+        )
+    model.highlight_row(keep)
+    assert model.highlighted_path() == str(keep.path)
+
+    model.set_visible([keep])
+
+    # A highlight cannot survive a filter change for its remaining window.
+    assert model.highlighted_path() is None
+    assert not model._highlight_timer.isActive()
+    kept_index = model.index(0, _TOOL_NAME_COLUMN)
+    assert model.data(kept_index, Qt.ItemDataRole.BackgroundRole) is None
+    # Selection pruning still drops the hidden row and keeps the visible one.
+    assert [str(tool.path) for tool in model.selected_tools()] == [str(keep.path)]
 
 
 def test_locked_rows_have_no_checkbox_and_reason() -> None:
@@ -777,6 +897,27 @@ def test_locked_rows_have_no_checkbox_and_reason() -> None:
         assert "<b>" in reason
         assert reason.endswith("<b>It cannot be removed from this app.</b>")
     assert model.data(model.index(3, _TOOL_CHECK_COLUMN), Qt.ItemDataRole.ToolTipRole) is None
+
+
+def test_unverified_name_row_is_unknown_and_locked() -> None:
+    from ui.main_window import ToolTableModel
+
+    tool = Tool(
+        name="Fallback",
+        path=Path("/root/compatibilitytools.d/Build"),
+        root=Path("/root"),
+        read_only=False,
+        name_unverified=True,
+    )
+    model = ToolTableModel()
+    model.set_items([tool], {}, {})
+    status_index = model.index(0, _TOOL_STATUS_COLUMN)
+    assert model.data(status_index, Qt.ItemDataRole.DisplayRole) == "Unknown"
+    check_index = model.index(0, _TOOL_CHECK_COLUMN)
+    assert model.data(check_index, Qt.ItemDataRole.CheckStateRole) is None
+    assert not model.is_deletable(tool)
+    reason = model.data(check_index, Qt.ItemDataRole.ToolTipRole)
+    assert "description could not be read" in reason
 
 
 def test_locked_check_cell_shows_info_glyph(qtbot) -> None:
@@ -882,7 +1023,7 @@ def test_tools_status_filter_combinations(qtbot, isolated_env: Path) -> None:
     assert window._tools_model.rows() == []
     window._tools_status_actions["Used"].setChecked(True)
     assert [tool.name for tool in window._tools_model.rows()] == ["BetaBuild"]
-    assert window._tools_status_button.toolTip() == "Status: Used + Read-only"
+    assert window._tools_status_button.toolTip() == "Status: Used + Read-only + Unknown"
 
 
 def test_tools_sort_orders(qtbot, isolated_env: Path) -> None:
@@ -1202,6 +1343,68 @@ def test_prefix_focus_handoff_resets_filters_and_highlights(qtbot, isolated_env:
     assert 777 in [row.app_id for row in window._model.rows()]
     assert window._model.highlighted_key() == prefix_key(target)
     assert window._store.selected() == []  # highlighted, never selected
+
+
+def test_tool_focus_handoff_clears_search_and_highlights(qtbot, isolated_env: Path) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    target = Tool(
+        name="Build",
+        path=isolated_env / "Build",
+        root=isolated_env,
+        read_only=False,
+    )
+    other = Tool(
+        name="Other",
+        path=isolated_env / "Other",
+        root=isolated_env,
+        read_only=False,
+    )
+    window._tools_model.set_items([target, other], {}, {})
+    window._all_tools = [target, other]  # normally filled by discovery
+    window._tools_search_box.setText("zzz-no-match")
+    window._tools_search_timer.timeout.emit()
+    assert window._tools_model.rows() == []
+
+    window._on_tool_focus_requested(target)
+
+    assert window._tabs.currentIndex() == _PAGE_TOOLS
+    assert window._tools_search_text == ""
+    assert window._tools_search_box.text() == ""
+    assert [row.name for row in window._tools_model.rows()] == ["Build", "Other"]
+    assert window._tools_model.highlighted_path() == str(target.path)
+    highlighted = window._tools_model.index(0, _TOOL_NAME_COLUMN)
+    brush = window._tools_model.data(highlighted, Qt.ItemDataRole.BackgroundRole)
+    assert brush is not None and brush.color() == QApplication.palette().color(
+        QPalette.ColorRole.Highlight
+    )
+    assert window._tools_model.selected_tools() == []  # highlighted, never selected
+
+    window._tools_model.clear_highlight()
+    assert window._tools_model.highlighted_path() is None
+    assert window._tools_model.data(highlighted, Qt.ItemDataRole.BackgroundRole) is None
+
+
+def test_tool_focus_expands_status_filter_when_target_hidden(qtbot, isolated_env: Path) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    used = Tool(
+        name="UsedBuild",
+        path=isolated_env / "UsedBuild",
+        root=isolated_env,
+        read_only=False,
+    )
+    window._tools_model.set_items([used], {str(used.path): [7]}, {})
+    window._all_tools = [used]  # normally filled by discovery
+    window._set_tools_status_filter({_TOOL_STATUS_UNUSED})
+    assert window._tools_model.rows() == []
+
+    window._on_tool_focus_requested(used)
+
+    assert window._tabs.currentIndex() == _PAGE_TOOLS
+    assert window._tools_statuses == set(_TOOL_STATUS_FILTERS)
+    assert [row.name for row in window._tools_model.rows()] == ["UsedBuild"]
+    assert window._tools_model.highlighted_path() == str(used.path)
 
 
 def test_orphan_review_handoff_filters_and_selects_visible(qtbot, isolated_env: Path) -> None:
@@ -1587,3 +1790,368 @@ def test_tools_delete_runs_off_thread_then_refreshes(qtbot, tools_deletion_setup
     assert calls == [target.resolve(strict=False)]
     assert dialog_calls == ["selection", "final"]
     assert summaries == []
+
+
+def test_close_event_increments_epoch(qtbot) -> None:
+    from PySide6.QtGui import QCloseEvent
+
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    initial_epoch = window._epoch
+    event = QCloseEvent()
+    window.closeEvent(event)
+    assert window._epoch == initial_epoch + 1
+
+
+def test_failed_mapping_marks_tools_unknown(qtbot, isolated_env, monkeypatch) -> None:
+    from core.toolmap import ToolMapError
+    from ui import main_window as main_window_module
+
+    tool = Tool(
+        name="Build",
+        path=isolated_env / "Build",
+        root=isolated_env,
+        read_only=False,
+    )
+    monkeypatch.setattr(
+        main_window_module,
+        "load_tool_mapping",
+        lambda roots: ({}, [ToolMapError(path=None, message="broken config")]),
+    )
+    monkeypatch.setattr(
+        main_window_module, "enumerate_tools", lambda roots, libraries: ([tool], [])
+    )
+    root = SteamRoot(path=isolated_env / "Steam", source=RootSource.NATIVE)
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+
+    window._on_discovery_finished((DiscoveryResult(roots=[root], libraries=[]), []), 0)
+
+    assert window._tool_errors
+    assert window._tools_model.usage_known is False
+    status = window._tools_model.index(0, _TOOL_STATUS_COLUMN)
+    assert window._tools_model.data(status) == "Unknown"
+    assert not window._tools_model.is_deletable(tool)
+    check = window._tools_model.index(0, _TOOL_CHECK_COLUMN)
+    assert window._tools_model.data(check, Qt.ItemDataRole.CheckStateRole) is None
+    assert not window._tools_model.flags(check) & Qt.ItemFlag.ItemIsUserCheckable
+    assert window._tools_model.selected_tools() == []
+
+
+def test_permission_denied_mapping_marks_tools_unknown(qtbot, isolated_env, monkeypatch) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root ignores file permissions")
+
+    tool = Tool(
+        name="Build",
+        path=isolated_env / "Build",
+        root=isolated_env,
+        read_only=False,
+    )
+    monkeypatch.setattr("ui.main_window.enumerate_tools", lambda roots, libraries: ([tool], []))
+    steam_root = isolated_env / "Steam"
+    config_path = steam_root / "config" / "config.vdf"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text('"CompatToolMapping"\n{\n    "480" "Build"\n}\n', encoding="utf-8")
+    config_path.chmod(0)
+    try:
+        root = SteamRoot(path=steam_root, source=RootSource.NATIVE)
+        window = MainWindow(auto_start=False)
+        qtbot.addWidget(window)
+
+        # A real unreadable config.vdf must fail closed: the tool
+        # renders as Unknown and stays non-deletable even though the
+        # mapping text maps it.
+        window._on_discovery_finished((DiscoveryResult(roots=[root], libraries=[]), []), 0)
+    finally:
+        config_path.chmod(0o644)
+
+    assert window._tool_errors
+    assert window._tools_model.usage_known is False
+    status = window._tools_model.index(0, _TOOL_STATUS_COLUMN)
+    assert window._tools_model.data(status) == "Unknown"
+    assert not window._tools_model.is_deletable(tool)
+    check = window._tools_model.index(0, _TOOL_CHECK_COLUMN)
+    assert window._tools_model.data(check, Qt.ItemDataRole.CheckStateRole) is None
+    assert not window._tools_model.flags(check) & Qt.ItemFlag.ItemIsUserCheckable
+
+
+def test_delete_tools_cancelled_when_mapping_reload_fails(qtbot, isolated_env, monkeypatch) -> None:
+    from core.toolmap import ToolMapError
+    from ui import main_window as main_window_module
+
+    tool = Tool(
+        name="Build",
+        path=isolated_env / "Build",
+        root=isolated_env,
+        read_only=False,
+    )
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    window._all_tools = [tool]
+    window._tools_model.set_items([tool], {}, {})
+    window._tools_model.set_visible_deletable_selected(True)
+    assert window._tools_model.selected_tools()
+
+    # The mapping reload at deletion time fails, so the run must be
+    # cancelled before any confirmation instead of proceeding with a
+    # fail-open empty mapping.
+    monkeypatch.setattr(
+        main_window_module,
+        "load_tool_mapping",
+        lambda roots: ({}, [ToolMapError(path=None, message="broken config")]),
+    )
+    dialog_calls: list[str] = []
+    monkeypatch.setattr(
+        main_window_module,
+        "confirm_selection",
+        lambda *args, **kwargs: dialog_calls.append("selection") or True,
+    )
+    monkeypatch.setattr(
+        main_window_module,
+        "confirm_final",
+        lambda *args, **kwargs: dialog_calls.append("final") or DeleteMode.TRASH,
+    )
+
+    window._on_delete_tools_clicked()
+
+    assert dialog_calls == []
+    assert window._tools_deleting is False
+    assert window._tools_delete_total == 0
+    assert window._tools_delete_done == 0
+    assert window._tools_delete_mode is None
+    assert window._tools_model.selected_tools()
+    assert "cancelled" in window._status.currentMessage()
+
+
+def test_delete_tools_reloads_mapping_in_worker(qtbot, tools_deletion_setup, monkeypatch) -> None:
+    from PySide6.QtCore import Qt
+
+    from core.deletion import RejectReason
+    from ui import workers as workers_module
+
+    window, target, calls, dialog_calls, summaries = tools_deletion_setup
+    # At click time the mapping is healthy and selects nothing. The
+    # mapping reloaded inside the worker selects the target, so the run
+    # must reject it instead of trusting the click-time snapshot.
+    monkeypatch.setattr(workers_module, "load_tool_mapping", lambda roots: ({480: "OldBuild"}, []))
+
+    initial_epoch = window._epoch
+    index = window._tools_model.index(0, _TOOL_CHECK_COLUMN)
+    assert window._tools_model.setData(
+        index, int(Qt.CheckState.Checked.value), Qt.ItemDataRole.CheckStateRole
+    )
+    window._on_delete_tools_clicked()
+    qtbot.waitUntil(lambda: not window._tools_deleting, timeout=15000)
+    qtbot.waitUntil(lambda: window._epoch > initial_epoch, timeout=15000)
+
+    assert calls == []
+    assert target.is_dir()
+    assert len(summaries) == 1
+    results = summaries[0]
+    assert [result.reject_reason for result in results] == [RejectReason.IN_USE]
+
+
+def test_delete_tools_fails_closed_when_worker_mapping_errors(
+    qtbot, tools_deletion_setup, monkeypatch
+) -> None:
+    from PySide6.QtCore import Qt
+
+    from core.deletion import DeletionStatus, RejectReason
+    from core.toolmap import ToolMapError
+    from ui import workers as workers_module
+    from ui.dialogs import summary_body
+
+    window, target, calls, dialog_calls, summaries = tools_deletion_setup
+    # The click-time gate passes, but the mapping reload inside the
+    # worker fails, so the batch fails closed with nothing deleted and
+    # the explicit reason surfaced in the summary.
+    monkeypatch.setattr(
+        workers_module,
+        "load_tool_mapping",
+        lambda roots: ({}, [ToolMapError(path=None, message="broken config")]),
+    )
+
+    initial_epoch = window._epoch
+    index = window._tools_model.index(0, _TOOL_CHECK_COLUMN)
+    assert window._tools_model.setData(
+        index, int(Qt.CheckState.Checked.value), Qt.ItemDataRole.CheckStateRole
+    )
+    window._on_delete_tools_clicked()
+    qtbot.waitUntil(lambda: not window._tools_deleting, timeout=15000)
+    qtbot.waitUntil(lambda: window._epoch > initial_epoch, timeout=15000)
+
+    assert calls == []
+    assert target.is_dir()
+    assert len(summaries) == 1
+    results = summaries[0]
+    assert all(result.status is DeletionStatus.REJECTED for result in results)
+    assert all(result.reject_reason is RejectReason.MAPPING_UNAVAILABLE for result in results)
+    assert "mapping_unavailable" in summary_body(results)
+
+
+def test_delete_tools_fails_closed_when_config_deleted_before_reload(
+    qtbot, tools_deletion_setup, monkeypatch
+) -> None:
+    from PySide6.QtCore import Qt
+
+    from core.deletion import DeletionStatus, RejectReason
+    from core.toolmap import load_tool_mapping as real_load_tool_mapping
+    from ui import workers as workers_module
+
+    window, target, calls, dialog_calls, summaries = tools_deletion_setup
+    config_path = Path(window._config.steam_roots[0]) / "config" / "config.vdf"
+    assert config_path.is_file()
+
+    # The mapping file is present when the click gate loads it and is gone
+    # by the time the worker reloads it. The reload must fail closed with
+    # nothing trashed instead of reading the missing file as an empty
+    # known mapping that unlocks every tool.
+    def load_after_delete(roots: object) -> tuple[dict[int, str], list[object]]:
+        config_path.unlink()
+        return real_load_tool_mapping(roots)
+
+    monkeypatch.setattr(workers_module, "load_tool_mapping", load_after_delete)
+
+    initial_epoch = window._epoch
+    index = window._tools_model.index(0, _TOOL_CHECK_COLUMN)
+    assert window._tools_model.setData(
+        index, int(Qt.CheckState.Checked.value), Qt.ItemDataRole.CheckStateRole
+    )
+    window._on_delete_tools_clicked()
+    qtbot.waitUntil(lambda: not window._tools_deleting, timeout=15000)
+    qtbot.waitUntil(lambda: window._epoch > initial_epoch, timeout=15000)
+
+    assert calls == []
+    assert target.is_dir()
+    assert len(summaries) == 1
+    results = summaries[0]
+    assert all(result.status is DeletionStatus.REJECTED for result in results)
+    assert all(result.reject_reason is RejectReason.MAPPING_UNAVAILABLE for result in results)
+
+
+def test_delete_tools_cancels_at_click_gate_when_mapping_shrinks(
+    qtbot, tools_deletion_setup, monkeypatch
+) -> None:
+    from PySide6.QtCore import Qt
+
+    from ui import main_window as main_window_module
+
+    window, target, calls, dialog_calls, summaries = tools_deletion_setup
+    # Scan-time mapping had an entry, but click-time reload produces an empty mapping.
+    window._tool_mapping = {480: "OldBuild"}
+    monkeypatch.setattr(
+        main_window_module,
+        "load_tool_mapping",
+        lambda roots: ({}, []),
+    )
+
+    index = window._tools_model.index(0, _TOOL_CHECK_COLUMN)
+    assert window._tools_model.setData(
+        index, int(Qt.CheckState.Checked.value), Qt.ItemDataRole.CheckStateRole
+    )
+    window._on_delete_tools_clicked()
+
+    assert dialog_calls == []
+    assert calls == []
+    assert target.is_dir()
+    assert not window._tools_deleting
+    assert window._status.currentMessage() == "Tool usage could not be read; deletion cancelled"
+
+
+def test_delete_tools_fails_closed_when_mapping_shrinks_before_reload(
+    qtbot, tools_deletion_setup, monkeypatch
+) -> None:
+    from PySide6.QtCore import Qt
+
+    from core.deletion import DeletionStatus, RejectReason
+    from ui import workers as workers_module
+
+    window, target, calls, dialog_calls, summaries = tools_deletion_setup
+    config_path = Path(window._config.steam_roots[0]) / "config" / "config.vdf"
+    config_path.write_text('"CompatToolMapping"\n{\n  "480" "OldBuild"\n}\n', encoding="utf-8")
+    window._tool_mapping = {480: "OldBuild"}
+
+    # Pre-click reload reads the intact config from disk and passes.
+    # Worker reload sees an empty mapping (shrunk).
+    monkeypatch.setattr(workers_module, "load_tool_mapping", lambda roots: ({}, []))
+
+    initial_epoch = window._epoch
+    index = window._tools_model.index(0, _TOOL_CHECK_COLUMN)
+    assert window._tools_model.setData(
+        index, int(Qt.CheckState.Checked.value), Qt.ItemDataRole.CheckStateRole
+    )
+    window._on_delete_tools_clicked()
+    qtbot.waitUntil(lambda: not window._tools_deleting, timeout=15000)
+    qtbot.waitUntil(lambda: window._epoch > initial_epoch, timeout=15000)
+
+    assert calls == []
+    assert target.is_dir()
+    assert len(summaries) == 1
+    results = summaries[0]
+    assert all(result.status is DeletionStatus.REJECTED for result in results)
+    assert all(result.reject_reason is RejectReason.MAPPING_UNAVAILABLE for result in results)
+
+
+def test_crashed_discovery_does_not_persist_empty_roots(
+    qtbot, isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from core.config import load_config, save_config
+    from core.discovery import DiscoveryError, DiscoveryErrorKind, DiscoveryResult
+
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    window._config.steam_roots = ["/existing/steam/root"]
+    save_config(window._config)
+
+    result = DiscoveryResult()
+    result.errors.append(DiscoveryError(kind=DiscoveryErrorKind.SYSTEM, message="crash", path=None))
+    window._on_discovery_finished((result, []), window._epoch)
+
+    reloaded = load_config()
+    assert reloaded.steam_roots == ["/existing/steam/root"]
+
+
+def test_crashed_discovery_with_permission_error_does_not_persist_empty_roots(
+    qtbot, isolated_env: Path
+) -> None:
+    from core.config import load_config, save_config
+    from core.discovery import DiscoveryError, DiscoveryErrorKind, DiscoveryResult
+
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    window._config.steam_roots = ["/existing/steam/root"]
+    save_config(window._config)
+
+    result = DiscoveryResult()
+    result.errors.append(
+        DiscoveryError(kind=DiscoveryErrorKind.PERMISSION, message="permission crash", path=None)
+    )
+    window._on_discovery_finished((result, []), window._epoch)
+
+    reloaded = load_config()
+    assert reloaded.steam_roots == ["/existing/steam/root"]
+
+
+def test_warning_tooltip_capped_at_max_lines(qtbot, isolated_env: Path) -> None:
+    from core.discovery import DiscoveryError, DiscoveryErrorKind, DiscoveryResult
+
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    result = DiscoveryResult()
+    for i in range(25):
+        result.errors.append(
+            DiscoveryError(
+                kind=DiscoveryErrorKind.MISSING,
+                message=f"error {i}",
+                path=Path(f"/missing/{i}"),
+            )
+        )
+    window._on_discovery_finished((result, []), window._epoch)
+    assert window._warning_count == 25
+    assert window._warning_label.text() == "25 warnings"
+    tooltip = window._warning_label.toolTip()
+    assert "and 5 more" in tooltip
+    assert "error 0" in tooltip
+    assert "error 19" in tooltip
+    assert "error 20" not in tooltip

@@ -9,6 +9,7 @@ import pytest
 from PySide6.QtCore import Qt
 
 from core.models import Prefix, PrefixType, ScanStatus, SelectionState, Store, prefix_key
+from ui.sanitize import sanitize_tooltip
 from ui.styles import MIN_HEADER_SECTION_PX
 from ui.table import (
     APP_ID_COLUMN,
@@ -154,7 +155,7 @@ def test_failed_scan_shows_unavailable_with_error_tooltip(tmp_path: Path) -> Non
     text = model.data(model.index(0, SIZE_COLUMN), Qt.ItemDataRole.DisplayRole)
     tooltip = model.data(model.index(0, SIZE_COLUMN), Qt.ItemDataRole.ToolTipRole)
     assert text == "Unavailable"
-    assert tooltip == "[errno 16] Device or resource busy"
+    assert tooltip == sanitize_tooltip("[errno 16] Device or resource busy")
 
 
 def test_scanning_status_text(tmp_path: Path) -> None:

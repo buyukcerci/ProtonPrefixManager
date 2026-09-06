@@ -5,17 +5,20 @@ from __future__ import annotations
 from pathlib import Path
 
 from core.analytics import (
+    ToolCategoryTotals,
     classification_totals,
     cumulative_share,
     has_known_size,
     largest_prefix,
     storage_capacity,
+    tool_category_totals,
     top_largest,
     total_count,
     total_size,
     use_zoom_mode,
 )
 from core.models import Prefix, PrefixType, ScanStatus
+from core.tools import Tool, ToolCategory
 
 
 def _prefix(
@@ -124,3 +127,67 @@ def test_use_zoom_mode_strict_threshold() -> None:
     assert use_zoom_mode(0, capacity) is True
     assert use_zoom_mode(50, None) is True  # unknown capacity forces zoom
     assert use_zoom_mode(50, 0) is True  # non-positive capacity forces zoom
+
+
+def _tool(name: str, size: int, *, read_only: bool = False) -> Tool:
+    return Tool(
+        name=name,
+        path=Path("/tools") / name,
+        root=Path("/root"),
+        read_only=read_only,
+        size_bytes=size,
+    )
+
+
+def test_tool_category_totals_includes_unknown_when_usage_unknown() -> None:
+    used = _tool("Used", 10)
+    reclaimable = _tool("Free", 20)
+    readonly = _tool("Locked", 30, read_only=True)
+    unknown = _tool("Mystery", 40)
+    tools = [used, reclaimable, readonly, unknown]
+    used_paths = {str(used.path)}
+
+    by_category = {
+        entry.category: entry for entry in tool_category_totals(tools, used_paths, usage_known=True)
+    }
+    assert by_category[ToolCategory.USED].count == 1
+    assert by_category[ToolCategory.RECLAIMABLE].count == 2
+    assert by_category[ToolCategory.READ_ONLY].count == 1
+    assert by_category[ToolCategory.UNKNOWN].count == 0
+
+    # A failed mapping load must not report anything as reclaimable.
+    by_category = {
+        entry.category: entry
+        for entry in tool_category_totals(tools, used_paths, usage_known=False)
+    }
+    assert by_category[ToolCategory.USED].count == 1
+    assert by_category[ToolCategory.READ_ONLY].count == 1
+    assert by_category[ToolCategory.RECLAIMABLE] == ToolCategoryTotals(
+        ToolCategory.RECLAIMABLE, 0, 0
+    )
+    assert by_category[ToolCategory.UNKNOWN] == ToolCategoryTotals(ToolCategory.UNKNOWN, 2, 60)
+
+
+def test_tool_category_totals_counts_unverified_names_as_unknown() -> None:
+    used = _tool("Used", 10)
+    unverified = Tool(
+        name="Fallback",
+        path=Path("/tools/Fallback"),
+        root=Path("/root"),
+        read_only=False,
+        size_bytes=20,
+        name_unverified=True,
+    )
+    tools = [used, unverified]
+    used_paths = {str(used.path)}
+
+    by_category = {
+        entry.category: entry for entry in tool_category_totals(tools, used_paths, usage_known=True)
+    }
+    assert by_category[ToolCategory.USED].count == 1
+    # A tool whose own compatibilitytool.vdf could not be read must not
+    # count as reclaimable even when the mapping load succeeded.
+    assert by_category[ToolCategory.RECLAIMABLE] == ToolCategoryTotals(
+        ToolCategory.RECLAIMABLE, 0, 0
+    )
+    assert by_category[ToolCategory.UNKNOWN] == ToolCategoryTotals(ToolCategory.UNKNOWN, 1, 20)

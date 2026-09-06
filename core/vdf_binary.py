@@ -12,9 +12,9 @@ this wire format and double as the fixture builder contract used by the
 test suite.
 """
 
-from __future__ import annotations
-
 from pathlib import Path
+
+from core.vdf_read import MAX_VDF_BYTES, read_vdf_bytes_bounded
 
 TYPE_DICT = 0x00
 TYPE_STRING = 0x01
@@ -26,6 +26,8 @@ _APP_ID_KEY = "appid"
 _APP_NAME_KEY = "AppName"
 
 _UINT32_MODULUS = 2**32
+
+_MAX_DICT_DEPTH = 100
 
 
 class ShortcutsParseError(ValueError):
@@ -43,33 +45,41 @@ def parse_shortcuts_vdf_bytes(data: bytes) -> dict[int, str]:
     unsigned decimal form on disk, so negative values are normalized.
     Trailing bytes after the root dictionary are ignored.
     """
-    if not data:
-        return {}
-    if data[0] != TYPE_DICT:
-        raise ShortcutsParseError(f"unexpected root marker byte 0x{data[0]:02x}")
-    if len(data) >= 2 and data[1] == TYPE_END:
-        return {}
-    if len(data) >= 2 and data[1] == TYPE_DICT:
-        root, _ = _parse_dict(data, 1)
-        block = root.get(_SHORTCUTS_KEY)
+    try:
+        if not data:
+            return {}
+        if data[0] != TYPE_DICT:
+            raise ShortcutsParseError(f"unexpected root marker byte 0x{data[0]:02x}")
+        if len(data) >= 2 and data[1] == TYPE_END:
+            return {}
+        if len(data) >= 2 and data[1] == TYPE_DICT:
+            root, _ = _parse_dict(data, 1)
+            block = root.get(_SHORTCUTS_KEY)
+            if isinstance(block, dict):
+                return _collect_shortcuts(block)
+            return _collect_shortcuts(root)
+        name, pos = _read_string(data, 1)
+        del name
+        entries, _ = _parse_dict(data, pos)
+        block = entries.get(_SHORTCUTS_KEY)
         if isinstance(block, dict):
             return _collect_shortcuts(block)
-        return _collect_shortcuts(root)
-    name, pos = _read_string(data, 1)
-    del name
-    entries, _ = _parse_dict(data, pos)
-    block = entries.get(_SHORTCUTS_KEY)
-    if isinstance(block, dict):
-        return _collect_shortcuts(block)
-    return _collect_shortcuts(entries)
+        return _collect_shortcuts(entries)
+    except RecursionError as exc:
+        raise ShortcutsParseError(f"excessive nesting depth: {exc}") from exc
 
 
 def load_shortcuts_vdf(path: Path) -> dict[int, str]:
     """Read the binary VDF file at path and extract its shortcut mapping."""
-    return parse_shortcuts_vdf_bytes(path.read_bytes())
+    data = read_vdf_bytes_bounded(path, MAX_VDF_BYTES)
+    if data is None:
+        raise ShortcutsParseError("unreadable, non-regular, or oversized file")
+    return parse_shortcuts_vdf_bytes(data)
 
 
-def _parse_dict(data: bytes, pos: int) -> tuple[dict[str, object], int]:
+def _parse_dict(data: bytes, pos: int, depth: int = 0) -> tuple[dict[str, object], int]:
+    if depth > _MAX_DICT_DEPTH:
+        raise ShortcutsParseError(f"excessive nesting depth beyond {_MAX_DICT_DEPTH}")
     entries: dict[str, object] = {}
     while True:
         if pos >= len(data):
@@ -82,7 +92,7 @@ def _parse_dict(data: bytes, pos: int) -> tuple[dict[str, object], int]:
         name, pos = _read_string(data, pos + 1)
         value: object
         if type_byte == TYPE_DICT:
-            value, pos = _parse_dict(data, pos)
+            value, pos = _parse_dict(data, pos, depth + 1)
         elif type_byte == TYPE_STRING:
             value, pos = _read_string(data, pos)
         else:

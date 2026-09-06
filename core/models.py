@@ -89,6 +89,21 @@ def prefix_key(prefix: Prefix) -> tuple[int, str]:
     return (prefix.app_id, str(prefix.path).rstrip("/"))
 
 
+def parse_ascii_decimal(val: object) -> int | None:
+    """Parse a string containing only ASCII decimal digits into an integer.
+
+    Returns None if val is not a string, contains non-ASCII characters,
+    non-decimal digits, or fails integer conversion such as exceeding the
+    integer string conversion limit.
+    """
+    if not isinstance(val, str) or not (val.isascii() and val.isdecimal()):
+        return None
+    try:
+        return int(val)
+    except ValueError:
+        return None
+
+
 _dedupe_key = prefix_key
 
 

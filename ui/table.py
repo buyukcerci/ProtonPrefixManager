@@ -34,6 +34,7 @@ from core.models import (
     format_size,
     prefix_key,
 )
+from ui.sanitize import sanitize_display, sanitize_tooltip
 from ui.styles import (
     APP_ID_DEFAULT_PX,
     CHECK_WIDTH_PX,
@@ -282,11 +283,11 @@ class PrefixTableModel(QAbstractTableModel):
 
     def _display_text(self, prefix: Prefix, row: int, column: int) -> str:
         if column == NAME_COLUMN:
-            return prefix.display_label
+            return sanitize_display(prefix.display_label)
         if column == APP_ID_COLUMN:
             return str(prefix.app_id)
         if column == PATH_COLUMN:
-            return str(prefix.path)
+            return sanitize_display(str(prefix.path))
         if column == SIZE_COLUMN:
             if not self.open_enabled(row):
                 return "-"
@@ -302,26 +303,29 @@ class PrefixTableModel(QAbstractTableModel):
         return ""
 
     def _tooltip(self, prefix: Prefix, row: int, column: int) -> str | None:
+        # Every tooltip boundary escapes markup because Qt renders
+        # tooltips as rich text when the text looks tag-like. Untrusted
+        # names are composed into plain text and escaped in one pass.
         if column == NAME_COLUMN:
             parts: list[str] = []
             if self._tool_provider is not None:
                 tool = self._tool_provider(prefix)
                 if tool and tool.strip():
-                    parts.append(f"Proton tool: {tool.strip()}")
+                    parts.append(f"Proton tool: {sanitize_display(tool.strip(), limit=None)}")
             if prefix.is_runtime_component:
                 parts.append(_RUNTIME_COMPONENT_TOOLTIP)
             if parts:
-                return ". ".join(parts)
+                return sanitize_tooltip(". ".join(parts))
             return None
         if column == PATH_COLUMN:
-            return str(prefix.path)
+            return sanitize_tooltip(str(prefix.path))
         if column == OPEN_COLUMN and not self.open_enabled(row):
             return _OPEN_DISABLED_TOOLTIP
         if column == SIZE_COLUMN and prefix.scan_status is ScanStatus.FAILED:
             if self._error_provider is not None:
                 error = self._error_provider(prefix)
                 if error:
-                    return error
+                    return sanitize_tooltip(error)
             return _SIZE_FAILED_TOOLTIP
         return None
 

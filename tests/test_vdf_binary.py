@@ -260,3 +260,41 @@ def test_invalid_utf8_string_raises() -> None:
     data = bytes([TYPE_DICT]) + b"\xff\xfe\x00"
     with pytest.raises(ShortcutsParseError):
         parse_shortcuts_vdf_bytes(data)
+
+
+def test_load_does_not_follow_symlink(tmp_path: Path) -> None:
+    real = tmp_path / "real.vdf"
+    real.write_bytes(build_shortcuts_vdf([(1, "Real Game")]))
+    link = tmp_path / "shortcuts.vdf"
+    link.symlink_to(real)
+    with pytest.raises((ShortcutsParseError, OSError)):
+        load_shortcuts_vdf(link)
+
+
+def test_load_does_not_block_on_fifo(tmp_path: Path) -> None:
+    import os
+
+    fifo = tmp_path / "shortcuts.vdf"
+    os.mkfifo(fifo)
+    with pytest.raises(ShortcutsParseError):
+        load_shortcuts_vdf(fifo)
+
+
+def test_load_rejects_oversized_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import core.vdf_binary as vdf_binary_module
+
+    path = tmp_path / "shortcuts.vdf"
+    path.write_bytes(build_shortcuts_vdf([(1, "Big Game")]) + b"\x00" * 64)
+    monkeypatch.setattr(vdf_binary_module, "MAX_VDF_BYTES", 4)
+    with pytest.raises(ShortcutsParseError):
+        load_shortcuts_vdf(path)
+
+
+def test_deeply_nested_input_raises_parse_error_not_recursion_error() -> None:
+    out = bytearray([TYPE_DICT])
+    for index in range(2000):
+        out += bytes([TYPE_DICT]) + f"k{index}\x00".encode()
+    out += bytes([TYPE_DICT]) + b"shortcuts\x00" + bytes([TYPE_END])
+    out += bytes([TYPE_END]) * 2001
+    with pytest.raises(ShortcutsParseError):
+        parse_shortcuts_vdf_bytes(bytes(out))

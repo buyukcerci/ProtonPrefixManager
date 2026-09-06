@@ -16,8 +16,9 @@ from pathlib import Path
 import vdf
 
 from core.discovery import COMPATDATA_DIR, STEAMAPPS_DIR, DiscoveryResult, Library, SteamRoot
-from core.models import Prefix, PrefixType, ScanStatus
+from core.models import Prefix, PrefixType, ScanStatus, parse_ascii_decimal
 from core.vdf_binary import ShortcutsParseError, load_shortcuts_vdf
+from core.vdf_read import MAX_VDF_BYTES, read_vdf_bounded
 
 USERDATA_DIR = "userdata"
 CONFIG_DIR = "config"
@@ -68,9 +69,10 @@ def enumerate_prefixes(
     """Enumerate prefixes under each library's compatdata in discovery order,
     skipping AppID 0 which is Steam's internal probe prefix.
 
-    Names resolve manifest first, then shortcut entries from every root's
-    userdata directories, then the Unknown fallback. Results dedupe on
-    (AppID, resolved path), keeping the first occurrence, using the same
+    Compatdata directory entries must be ASCII decimal digits. Names resolve
+    manifest first, then shortcut entries from every root's userdata
+    directories, then the Unknown fallback. Results dedupe on (AppID,
+    resolved path), keeping the first occurrence, using the same
     normalization as Store._dedupe_key. Symlinked compatdata children are
     intentionally skipped instead of followed, so prefixes relocated via
     symlinks are never listed outside their library. Unreadable or missing
@@ -88,9 +90,9 @@ def enumerate_prefixes(
         for entry in entries:
             if entry.is_symlink() or not entry.is_dir():
                 continue
-            if not entry.name.isdigit():
+            app_id = parse_ascii_decimal(entry.name)
+            if app_id is None:
                 continue
-            app_id = int(entry.name)
             # Skip ignored probe prefixes (see IGNORED_APP_IDS).
             if app_id in IGNORED_APP_IDS:
                 continue
@@ -136,12 +138,14 @@ def _manifest_name(library_path: Path, app_id: int) -> str | None:
     """Return the manifest display name, or None when absent/unreadable."""
     manifest = library_path / STEAMAPPS_DIR / f"appmanifest_{app_id}.acf"
     try:
-        text = manifest.read_text(encoding="utf-8-sig")
-    except OSError:
+        text = read_vdf_bounded(manifest, MAX_VDF_BYTES)
+    except (OSError, UnicodeDecodeError):
+        return None
+    if text is None:
         return None
     try:
         data = vdf.loads(text)
-    except (TypeError, ValueError, SyntaxError):
+    except (TypeError, ValueError, SyntaxError, RecursionError):
         return None
     if not isinstance(data, dict):
         return None
@@ -172,7 +176,7 @@ def _load_shortcuts(roots: Sequence[SteamRoot]) -> dict[int, str]:
         for shortcuts_path in files:
             try:
                 entries = load_shortcuts_vdf(shortcuts_path)
-            except (ShortcutsParseError, OSError):
+            except (ShortcutsParseError, OSError, RecursionError):
                 continue
             for app_id, name in entries.items():
                 merged.setdefault(app_id, name)

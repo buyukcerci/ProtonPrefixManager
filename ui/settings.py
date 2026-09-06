@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-from PySide6.QtCore import QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFontDatabase, QValidator
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 
 from core.config import AppConfig
 from core.discovery import Library, SteamRoot
+from core.models import parse_ascii_decimal
 
 DEFAULT_FONT_SIZE = 10
 MIN_FONT_SIZE = 7
@@ -49,15 +50,16 @@ class _FontSizeSpin(QSpinBox):
     """
 
     def validate(self, text: str, pos: int) -> tuple[QValidator.State, str, int]:
-        if self._numeric_part(text).isdigit():
+        if parse_ascii_decimal(self._numeric_part(text)) is not None:
             return QValidator.State.Acceptable, text, pos
         return super().validate(text, pos)
 
     def valueFromText(self, text: str) -> int:
         part = self._numeric_part(text)
-        if not part.isdigit():
+        val = parse_ascii_decimal(part)
+        if val is None:
             return self.value()
-        return min(max(int(part), self.minimum()), self.maximum())
+        return min(max(val, self.minimum()), self.maximum())
 
     def _numeric_part(self, text: str) -> str:
         return text.removesuffix(self.suffix()).strip()
@@ -240,7 +242,12 @@ class SettingsDialog(QDialog):
         return row if 0 <= row < len(self._custom_roots) else None
 
     def _warn(self, message: str) -> None:
-        QMessageBox.warning(self, "Settings", message)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Settings")
+        box.setText(message)
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.exec()
 
     def _pick_directory(self, *, current: str | None = None) -> str | None:
         start = current if current and Path(current).is_dir() else str(Path.home())

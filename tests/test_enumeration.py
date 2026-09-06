@@ -156,6 +156,20 @@ def test_malformed_manifest_without_shortcut_yields_orphan(tmp_path: Path) -> No
     assert prefixes[0].prefix_type is PrefixType.ORPHANED
 
 
+def test_manifest_recursion_error_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from core import enumeration as enumeration_module
+
+    lib = _make_library(tmp_path, app_ids=(502,), manifests={502: "Game 502"})
+
+    def boom(text: str) -> dict[str, object]:
+        raise RecursionError("nesting too deep")
+
+    monkeypatch.setattr(enumeration_module.vdf, "loads", boom)
+    assert enumeration_module._manifest_name(lib.path, 502) is None
+
+
 def test_corrupt_shortcuts_file_skipped_valid_one_used(tmp_path: Path) -> None:
     lib = _make_library(tmp_path, app_ids=(700,))
     corrupt = tmp_path / "root" / "userdata" / "1" / "config"
@@ -191,6 +205,15 @@ def test_non_numeric_and_file_entries_ignored(tmp_path: Path) -> None:
     (compatdata / "pfx").mkdir()
     (compatdata / ".DS_Store").write_text("", encoding="utf-8")
     (compatdata / "not-a-prefix.txt").write_text("file", encoding="utf-8")
+    prefixes = enumerate_prefixes([lib])
+    assert len(prefixes) == 1
+    assert prefixes[0].app_id == 900
+
+
+def test_unicode_digit_compatdata_entry_skipped_without_crash(tmp_path: Path) -> None:
+    lib = _make_library(tmp_path, app_ids=(900,))
+    compatdata = lib.path / "steamapps" / "compatdata"
+    (compatdata / "¹").mkdir()
     prefixes = enumerate_prefixes([lib])
     assert len(prefixes) == 1
     assert prefixes[0].app_id == 900

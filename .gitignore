@@ -9,3 +9,6 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+.opencode/
+.agents/
+skills-lock.json

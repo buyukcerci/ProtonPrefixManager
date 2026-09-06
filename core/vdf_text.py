@@ -6,6 +6,9 @@ from pathlib import Path
 
 import vdf
 
+from core.models import parse_ascii_decimal
+from core.vdf_read import MAX_VDF_BYTES, read_vdf_bounded
+
 LIBRARY_FOLDERS_KEY = "libraryfolders"
 PATH_KEY = "path"
 
@@ -27,7 +30,7 @@ def parse_library_folders_text(text: str) -> list[str]:
     """
     try:
         data = vdf.loads(text)
-    except (TypeError, ValueError, SyntaxError) as exc:
+    except (TypeError, ValueError, SyntaxError, RecursionError) as exc:
         raise LibraryFoldersParseError(str(exc)) from exc
     if not isinstance(data, dict):
         raise LibraryFoldersParseError("top-level VDF value is not a mapping")
@@ -39,7 +42,9 @@ def parse_library_folders_text(text: str) -> list[str]:
 
 def load_library_folder_paths(path: Path) -> list[str]:
     """Read the file at path and extract its library paths."""
-    text = path.read_text(encoding="utf-8-sig")
+    text = read_vdf_bounded(path, MAX_VDF_BYTES)
+    if text is None:
+        raise LibraryFoldersParseError("unreadable, non-regular, or oversized file")
     return parse_library_folders_text(text)
 
 
@@ -62,8 +67,7 @@ def _collect_paths(block: dict) -> list[str]:
             if isinstance(entry, str) and entry.strip():
                 paths.append(entry.strip())
         elif (
-            isinstance(key, str)
-            and key.isdigit()
+            parse_ascii_decimal(key) is not None
             and isinstance(value, str)
             and value.strip().startswith("/")
         ):

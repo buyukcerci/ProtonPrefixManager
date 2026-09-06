@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 
 import pytest
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette
 
 from core.config import AppConfig
@@ -37,6 +38,10 @@ HEX_COLOR_PATTERN = re.compile(r"#[0-9a-fA-F]{3,8}\b")
 def test_stylesheet_is_nonempty_and_color_free() -> None:
     assert STYLESHEET.strip()
     assert not HEX_COLOR_PATTERN.search(STYLESHEET), "QSS must not hardcode colors"
+
+
+def test_status_warning_label_has_stylesheet_rule() -> None:
+    assert re.search(r"QLabel#statusWarningLabel\s*\{", STYLESHEET) is not None
 
 
 def test_apply_app_style_sets_application_stylesheet(restored_app_state) -> None:
@@ -191,6 +196,12 @@ def test_secondary_label_mutes_window_text(qtbot, restored_app_palette) -> None:
     assert muted.green() == source.green()
     assert muted.blue() == source.blue()
     assert muted.alpha() == MUTED_TEXT_ALPHA
+
+
+def test_secondary_label_visible_text_is_plain(qtbot) -> None:
+    label = SecondaryLabel("caption <b>text</b>")
+    qtbot.addWidget(label)
+    assert label.textFormat() == Qt.TextFormat.PlainText
 
 
 def test_secondary_label_follows_theme_changes(qtbot, restored_app_palette) -> None:

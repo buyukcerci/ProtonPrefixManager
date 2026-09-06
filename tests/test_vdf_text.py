@@ -94,6 +94,17 @@ def test_truncated_text_raises() -> None:
         parse_library_folders_text(truncated)
 
 
+def test_recursion_error_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    from core import vdf_text as vdf_text_module
+
+    def boom(text: str) -> dict[str, object]:
+        raise RecursionError("nesting too deep")
+
+    monkeypatch.setattr(vdf_text_module.vdf, "loads", boom)
+    with pytest.raises(LibraryFoldersParseError):
+        parse_library_folders_text('"libraryfolders"\n{\n}')
+
+
 def test_unicode_paths_are_preserved() -> None:
     text = '"libraryfolders"\n{\n    "0"\n    {\n        "path" "/spiele/Bücherroote"\n    }\n}\n'
     assert parse_library_folders_text(text) == ["/spiele/Bücherroote"]

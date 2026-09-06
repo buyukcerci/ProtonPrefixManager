@@ -30,6 +30,8 @@ class DiscoveryErrorKind(StrEnum):
     PERMISSION = "permission"
     PARSE = "parse"
     MISSING = "missing"
+    SYSTEM = "system"
+    CRASH = "crash"
 
 
 @dataclass(slots=True)

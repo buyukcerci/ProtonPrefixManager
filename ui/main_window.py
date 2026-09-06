@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import replace
+from pathlib import Path
 
 from PySide6.QtCore import (
     QAbstractTableModel,
@@ -15,8 +17,9 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtGui import QAction, QBrush, QIcon, QPalette
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -47,7 +50,13 @@ from core.deletion import (
     DeletionStatus,
     ToolDeletionResult,
 )
-from core.discovery import DiscoveryResult, Library, SteamRoot
+from core.discovery import (
+    DiscoveryError,
+    DiscoveryErrorKind,
+    DiscoveryResult,
+    Library,
+    SteamRoot,
+)
 from core.models import Prefix, PrefixType, ScanStatus, Store, format_size, prefix_key
 from core.opener import OpenStatus, can_open
 from core.scanner import (
@@ -58,8 +67,15 @@ from core.scanner import (
     load_cached,
     refresh_needed,
 )
-from core.toolmap import ToolMapError, load_tool_mapping, tool_name_for
-from core.tools import SYSTEM_TOOLS_DIR, Tool, enumerate_tools, used_by
+from core.toolmap import ToolMapError, contributing_roots, load_tool_mapping, tool_name_for
+from core.tools import (
+    SYSTEM_TOOLS_DIR,
+    EnumerationWarning,
+    Tool,
+    enumerate_tools,
+    is_reclaimable,
+    used_by,
+)
 from ui.dialogs import (
     confirm_final,
     confirm_selection,
@@ -68,13 +84,17 @@ from ui.dialogs import (
     unscanned_note_for,
 )
 from ui.overview import OverviewPage
+from ui.sanitize import sanitize_display, sanitize_tooltip
 from ui.settings import SettingsDialog
 from ui.styles import (
     CHECK_WIDTH_PX,
+    HIGHLIGHT_DURATION_MS,
     MESSAGE_ICON_SIZE_PX,
     MESSAGE_LAYOUT_SPACING_PX,
     MESSAGE_PAGE_MARGIN_PX,
     SEARCH_DEBOUNCE_MS,
+    TOOLS_OVERVIEW_DEBOUNCE_MS,
+    SecondaryLabel,
     apply_app_style,
 )
 from ui.table import (
@@ -93,6 +113,8 @@ from ui.workers import (
     ToolDeletionWorker,
     ToolSizeWorker,
 )
+
+_logger = logging.getLogger(__name__)
 
 _PAGE_MESSAGE = 0
 _PAGE_CONTENT = 1
@@ -113,6 +135,7 @@ _NO_ROWS_TEXT = "No prefixes match the current view."
 _NO_TOOLS_ROWS_TEXT = "No tools match the current view."
 
 _SCAN_WAIT_MS = 2000
+_WARNING_TOOLTIP_MAX_LINES = 20
 
 _TYPE_LABELS = {
     PrefixType.STEAM: "Steam Games",
@@ -136,6 +159,7 @@ _TOOL_HEADER_LABELS = {
 _TOOL_STATUS_USED = "Used"
 _TOOL_STATUS_READ_ONLY = "Read-only"
 _TOOL_STATUS_UNUSED = "Unused"
+_TOOL_STATUS_UNKNOWN = "Unknown"
 
 _TOOL_SORTABLE_COLUMNS = {
     _TOOL_NAME_COLUMN: "name",
@@ -143,36 +167,58 @@ _TOOL_SORTABLE_COLUMNS = {
     _TOOL_STATUS_COLUMN: "status",
 }
 
-_TOOL_STATUS_FILTERS = (_TOOL_STATUS_USED, _TOOL_STATUS_UNUSED, _TOOL_STATUS_READ_ONLY)
+_TOOL_STATUS_FILTERS = (
+    _TOOL_STATUS_USED,
+    _TOOL_STATUS_UNUSED,
+    _TOOL_STATUS_READ_ONLY,
+    _TOOL_STATUS_UNKNOWN,
+)
 
 _TOOL_MODEL_ROOT_INDEX = QModelIndex()
 
 
-def _tool_status(tool: Tool, used: set[str]) -> str:
+def _tool_status(tool: Tool, used: set[str], *, usage_known: bool) -> str:
     if str(tool.path) in used:
         return _TOOL_STATUS_USED
     if tool.read_only:
         return _TOOL_STATUS_READ_ONLY
+    if not usage_known or tool.name_unverified:
+        return _TOOL_STATUS_UNKNOWN
     return _TOOL_STATUS_UNUSED
 
 
-def _tool_facets(tool: Tool, used: set[str]) -> set[str]:
-    """Status labels applying to a tool; used and read-only can overlap."""
+def _tool_facets(tool: Tool, used: set[str], *, usage_known: bool) -> set[str]:
+    """Status labels applying to a tool; used and read-only can overlap.
+
+    The filter uses these overlapping facets, so a used read-only build
+    matches both Used and Read-only. The overview breakdown instead
+    partitions the total with Read-only (unused) holding only unused
+    read-only builds. When the usage mapping is unavailable, or a
+    writable build's own tool description could not be read, that build
+    carries the Unknown facet instead of Unused so a mapping value
+    selecting the unread display name can never read as deletable.
+    """
     facets: set[str] = set()
     if str(tool.path) in used:
         facets.add(_TOOL_STATUS_USED)
     if tool.read_only:
         facets.add(_TOOL_STATUS_READ_ONLY)
     if not facets:
-        facets.add(_TOOL_STATUS_UNUSED)
+        unknown = not usage_known or tool.name_unverified
+        facets.add(_TOOL_STATUS_UNKNOWN if unknown else _TOOL_STATUS_UNUSED)
     return facets
 
 
 class ToolTableModel(QAbstractTableModel):
     """Read-only tool rows with checkboxes limited to deletable tools.
 
-    Only unused writable tools are checkable. Used and read-only tools
-    render without a checkbox and cannot be selected for delete.
+    Only unused writable tools with a successfully loaded usage mapping
+    are checkable. Used and read-only tools render without a checkbox and
+    cannot be selected for delete. While the mapping load has failed,
+    every tool renders as Unknown and nothing is checkable. A writable
+    tool whose own description could not be read also renders as Unknown
+    and stays unchecked, because the mapping may select the display name
+    that tool could not resolve.
     """
 
     selection_changed = Signal()
@@ -185,22 +231,33 @@ class ToolTableModel(QAbstractTableModel):
         self._pending: set[str] = set()
         self._failed: set[str] = set()
         self._selected: set[str] = set()
+        self._usage_known = True
+        self._highlighted_path: str | None = None
+        self._highlight_timer = QTimer(self)
+        self._highlight_timer.setSingleShot(True)
+        self._highlight_timer.timeout.connect(self.clear_highlight)
 
     def set_items(
         self,
         tools: Sequence[Tool],
         used_by: dict[str, list[int]],
         names: dict[int, str],
+        usage_known: bool = True,
     ) -> None:
         self.beginResetModel()
         self._tools = list(tools)
         self._used_by = dict(used_by)
         self._names = dict(names)
+        self._usage_known = usage_known
         self._pending = {str(tool.path) for tool in tools}
         self._failed.clear()
         self._selected.clear()
         self.endResetModel()
         self.selection_changed.emit()
+
+    @property
+    def usage_known(self) -> bool:
+        return self._usage_known
 
     @property
     def used(self) -> set[str]:
@@ -209,6 +266,10 @@ class ToolTableModel(QAbstractTableModel):
     @property
     def pending(self) -> set[str]:
         return set(self._pending)
+
+    @property
+    def failed(self) -> set[str]:
+        return set(self._failed)
 
     def set_tool_size(self, path: str, size_bytes: int, error: str | None) -> None:
         """Store one async size result and refresh its size cell."""
@@ -246,6 +307,39 @@ class ToolTableModel(QAbstractTableModel):
     def selected_tools(self) -> list[Tool]:
         return [tool for tool in self._tools if str(tool.path) in self._selected]
 
+    def highlight_row(self, tool: Tool) -> None:
+        """Mark one row as highlighted for a short window (no selection change).
+
+        A highlight that moves from another row first clears that row's
+        highlight state, so the old row stops painting highlighted
+        instead of waiting for an unrelated repaint.
+        """
+        previous = self._highlighted_path
+        if previous is not None and previous != str(tool.path):
+            self._emit_rows_changed_for(previous)
+        self._highlighted_path = str(tool.path)
+        self._emit_rows_changed_for(self._highlighted_path)
+        self._highlight_timer.start(HIGHLIGHT_DURATION_MS)
+
+    def clear_highlight(self) -> None:
+        path = self._highlighted_path
+        if path is None:
+            return
+        self._highlighted_path = None
+        self._emit_rows_changed_for(path)
+
+    def highlighted_path(self) -> str | None:
+        return self._highlighted_path
+
+    def _emit_rows_changed_for(self, path: str) -> None:
+        for row, tool in enumerate(self._tools):
+            if str(tool.path) == path:
+                self.dataChanged.emit(
+                    self.index(row, _TOOL_CHECK_COLUMN),
+                    self.index(row, _TOOL_STATUS_COLUMN),
+                )
+                return
+
     def rows(self) -> list[Tool]:
         return list(self._tools)
 
@@ -253,15 +347,26 @@ class ToolTableModel(QAbstractTableModel):
         return str(tool.path) in self._selected
 
     def is_deletable(self, tool: Tool) -> bool:
-        return str(tool.path) not in self.used and not tool.read_only
+        return is_reclaimable(tool, self.used, usage_known=self._usage_known)
 
     def set_visible(self, tools: Sequence[Tool]) -> None:
-        """Re-slice visible rows, dropping selections hidden by the filter."""
+        """Re-slice visible rows, dropping selections hidden by the filter.
+
+        A highlight never survives a filter change: the stored path is
+        cleared and its timer stopped alongside the selection pruning,
+        and the old path still emits dataChanged afterwards so the view
+        repaints the row without the highlight colors.
+        """
+        previous = self._highlighted_path
+        self._highlighted_path = None
+        self._highlight_timer.stop()
         self.beginResetModel()
         self._tools = list(tools)
         visible = {str(tool.path) for tool in tools}
         self._selected = {key for key in self._selected if key in visible}
         self.endResetModel()
+        if previous is not None:
+            self._emit_rows_changed_for(previous)
         self.selection_changed.emit()
 
     def set_visible_deletable_selected(self, selected: bool) -> None:
@@ -299,6 +404,13 @@ class ToolTableModel(QAbstractTableModel):
             return None
         tool = self._tools[index.row()]
         column = index.column()
+        if self._highlighted_path is not None and str(tool.path) == self._highlighted_path:
+            if role == Qt.ItemDataRole.BackgroundRole:
+                palette = QApplication.palette()
+                return QBrush(palette.color(QPalette.ColorRole.Highlight))
+            if role == Qt.ItemDataRole.ForegroundRole:
+                palette = QApplication.palette()
+                return QBrush(palette.color(QPalette.ColorRole.HighlightedText))
         if role == Qt.ItemDataRole.DisplayRole:
             return self._display_text(tool, column)
         if column == _TOOL_CHECK_COLUMN and role == Qt.ItemDataRole.CheckStateRole:
@@ -371,7 +483,7 @@ class ToolTableModel(QAbstractTableModel):
 
     def _display_text(self, tool: Tool, column: int) -> str:
         if column == _TOOL_NAME_COLUMN:
-            return tool.name
+            return sanitize_display(tool.name)
         if column == _TOOL_SIZE_COLUMN:
             if str(tool.path) in self._pending:
                 return "Scanning..."
@@ -379,10 +491,14 @@ class ToolTableModel(QAbstractTableModel):
                 return "Unavailable"
             return format_size(tool.size_bytes)
         if column == _TOOL_STATUS_COLUMN:
-            return _tool_status(tool, self.used)
+            return _tool_status(tool, self.used, usage_known=self._usage_known)
         return ""
 
     def _name_tooltip(self, tool: Tool) -> str:
+        # Tooltip content is sanitized at the boundary: Qt renders tooltips
+        # as rich text when the text looks tag-like, so tool and game names
+        # must not carry raw markup. The composed plain text is escaped in
+        # one pass, so untrusted names stay inside the escaped document.
         lines: list[str] = []
         app_ids = self._used_by.get(str(tool.path), [])
         if app_ids:
@@ -390,24 +506,29 @@ class ToolTableModel(QAbstractTableModel):
             for app_id in app_ids:
                 name = self._names.get(app_id)
                 if name:
-                    parts.append(f"{name} ({app_id})")
+                    parts.append(f"{sanitize_display(name, limit=None)} ({app_id})")
                 else:
                     parts.append(f"AppID {app_id}")
             lines.append("Used by: " + ", ".join(parts))
         if tool.read_only:
             lines.append("Read-only: this build cannot be removed from this app.")
         lines.append(str(tool.path))
-        return "\n".join(lines)
+        return sanitize_tooltip("\n".join(lines))
 
     def _lock_reason(self, tool: Tool) -> str:
         # Tooltip-only HTML: DisplayRole never returns markup, so plain-text
-        # cells cannot leak these tags. The bold tail is for tooltips only.
+        # cells cannot leak these tags. No untrusted data is interpolated
+        # below, only fixed strings, so the bold tail stays safe.
         tail = "<b>It cannot be removed from this app.</b>"
         if tool.read_only:
             system = SYSTEM_TOOLS_DIR.resolve(strict=False)
             if tool.path == system or system in tool.path.parents:
                 return f"System-owned: this build belongs to the package manager. {tail}"
             return f"Steam-managed: this build belongs to Steam. {tail}"
+        if not self._usage_known:
+            return f"Usage unknown: the tool mapping could not be read. {tail}"
+        if tool.name_unverified:
+            return f"Usage unknown: this tool's description could not be read. {tail}"
         return f"In use: this build is selected by a game. {tail}"
 
 
@@ -434,6 +555,9 @@ class MainWindow(QMainWindow):
         self._roots: list[SteamRoot] = []
         self._tool_mapping: dict[int, str] = {}
         self._tool_errors: list[ToolMapError] = []
+        self._contributing_roots: set[Path] = set()
+        self._enumeration_warnings: list[EnumerationWarning] = []
+        self._discovery_errors: list[DiscoveryError] = []
         self._warning_count: int = 0
         self._all_tools: list[Tool] = []
         self._tools_search_text = ""
@@ -441,6 +565,7 @@ class MainWindow(QMainWindow):
             _TOOL_STATUS_USED,
             _TOOL_STATUS_UNUSED,
             _TOOL_STATUS_READ_ONLY,
+            _TOOL_STATUS_UNKNOWN,
         }
         self._tools_sort_key = "name"
         self._tools_sort_descending = False
@@ -461,6 +586,7 @@ class MainWindow(QMainWindow):
         self._pending_filter_reset = False
         self._pending_select_all_visible = False
         self._pending_highlight_key: tuple[int, str] | None = None
+        self._pending_tool_focus_path: str | None = None
         self._apply_window_font()
 
         self._model = PrefixTableModel(
@@ -549,6 +675,8 @@ class MainWindow(QMainWindow):
         # sizes until restart; everything else follows immediately.
         self._overview.orphan_review_requested.connect(self._on_orphan_review_requested)
         self._overview.prefix_focus_requested.connect(self._on_prefix_focus_requested)
+        self._overview.tool_review_requested.connect(self._on_tool_review_requested)
+        self._overview.tool_focus_requested.connect(self._on_tool_focus_requested)
 
         self._tabs = QTabWidget()
         self._tabs.addTab(self._overview, "Overview")
@@ -570,10 +698,30 @@ class MainWindow(QMainWindow):
         self._search_timer.setInterval(SEARCH_DEBOUNCE_MS)
         self._search_timer.timeout.connect(self._apply_filters)
 
+        # Async tool size results arrive one per tool; the tools overview
+        # section rebuilds fully on each refresh, so the refreshes are
+        # debounced into one run after the burst settles.
+        self._tools_overview_timer = QTimer(self)
+        self._tools_overview_timer.setSingleShot(True)
+        self._tools_overview_timer.setInterval(TOOLS_OVERVIEW_DEBOUNCE_MS)
+        self._tools_overview_timer.timeout.connect(self._refresh_tools_overview)
+
+        # A tool focus request defers its scroll until after the tools
+        # tab has laid out, so the scroll centers the located row. The
+        # timer is a single reusable child of the window, so repeated
+        # focus requests neither accumulate timers nor outlive the
+        # window's widgets.
+        self._tools_scroll_timer = QTimer(self)
+        self._tools_scroll_timer.setSingleShot(True)
+        self._tools_scroll_timer.timeout.connect(self._scroll_to_pending_tool)
+
         self._build_menu()
         self._status = QStatusBar()
         self.setStatusBar(self._status)
-
+        self._warning_label = SecondaryLabel(parent=self._status)
+        self._warning_label.setObjectName("statusWarningLabel")
+        self._warning_label.hide()
+        self._status.addPermanentWidget(self._warning_label)
         self._table.sort_column_clicked.connect(self._on_sort_column_clicked)
         self._table.header_toggle_clicked.connect(self._on_header_toggle)
         self._table.clicked.connect(self._on_table_clicked)
@@ -582,6 +730,33 @@ class MainWindow(QMainWindow):
         self._apply_initial_sort_indicator()
         if auto_start:
             self.refresh()
+
+    def _update_warning_indicator(self) -> None:
+        lines: list[str] = []
+        for disc_err in self._discovery_errors:
+            loc = f" ({disc_err.path})" if disc_err.path else ""
+            lines.append(f"{disc_err.message}{loc}")
+        for tool_err in self._tool_errors:
+            loc = f" ({tool_err.path})" if tool_err.path else ""
+            lines.append(f"{tool_err.message}{loc}")
+        for warning in self._enumeration_warnings:
+            loc = f" ({warning.path})" if warning.path else ""
+            lines.append(f"{warning.message}{loc}")
+        self._warning_count = len(lines)
+        if not lines:
+            self._warning_label.hide()
+            self._warning_label.setText("")
+            self._warning_label.setToolTip("")
+            return
+        noun = "warning" if len(lines) == 1 else "warnings"
+        self._warning_label.setText(f"{len(lines)} {noun}")
+        if len(lines) > _WARNING_TOOLTIP_MAX_LINES:
+            excess = len(lines) - _WARNING_TOOLTIP_MAX_LINES
+            tooltip_lines = [*lines[:_WARNING_TOOLTIP_MAX_LINES], f"and {excess} more"]
+        else:
+            tooltip_lines = lines
+        self._warning_label.setToolTip(sanitize_tooltip("\n".join(tooltip_lines)))
+        self._warning_label.show()
 
     def _build_filter_bar(self, parent: QWidget) -> QWidget:
         bar = QWidget(parent)
@@ -782,21 +957,30 @@ class MainWindow(QMainWindow):
         self._tools_search_text = text.strip()
         self._tools_search_timer.start()
 
+    def _clear_tools_search(self) -> None:
+        """Reset the tools search box without triggering a filter pass."""
+        self._tools_search_text = ""
+        self._tools_search_box.blockSignals(True)
+        self._tools_search_box.clear()
+        self._tools_search_box.blockSignals(False)
+        self._tools_search_timer.stop()
+
     def _apply_tools_filter(self) -> None:
         """Re-slice all tools through status and search into the model."""
         text = self._tools_search_text.strip().casefold()
         used = self._tools_model.used
+        usage_known = self._tools_model.usage_known
         visible = [
             tool
             for tool in self._all_tools
-            if _tool_facets(tool, used) & self._tools_statuses
+            if _tool_facets(tool, used, usage_known=usage_known) & self._tools_statuses
             and (not text or text in tool.name.casefold())
         ]
         if self._tools_sort_key == "size":
             visible.sort(key=lambda tool: tool.size_bytes, reverse=self._tools_sort_descending)
         elif self._tools_sort_key == "status":
             visible.sort(
-                key=lambda tool: _tool_status(tool, used),
+                key=lambda tool: _tool_status(tool, used, usage_known=usage_known),
                 reverse=self._tools_sort_descending,
             )
         else:
@@ -828,6 +1012,18 @@ class MainWindow(QMainWindow):
         tools = self._tools_model.selected_tools()
         if not tools or self._tools_deleting or self._deleting:
             return
+        # The used set is re-resolved inside the deletion worker from a
+        # mapping loaded at run time, so a tool selected by a game after
+        # the click is still detected. This pre-click load is only an
+        # early gate: if the mapping cannot be read, usage is unknown for
+        # every tool and the run is cancelled before any confirmation
+        # instead of proceeding against a fail-open empty mapping.
+        reloaded_mapping, mapping_errors = load_tool_mapping(self._roots)
+        shrunk = any(app_id not in reloaded_mapping for app_id in self._tool_mapping)
+        roots_shrunk = not self._contributing_roots.issubset(contributing_roots(self._roots))
+        if mapping_errors or shrunk or roots_shrunk:
+            self._status.showMessage("Tool usage could not be read; deletion cancelled", 5000)
+            return
         names = [tool.name for tool in tools]
         total_text = format_size(sum(tool.size_bytes for tool in tools))
         note = tools_pending_note_for(tools, self._tools_model.pending)
@@ -844,12 +1040,20 @@ class MainWindow(QMainWindow):
         self._update_delete_button()
         self._update_delete_tools_button()
         self._refresh_action.setEnabled(False)
-        self._status.showMessage(f"Deleting 0/{self._tools_delete_total}")
         epoch = self._epoch
-        worker = ToolDeletionWorker(tools, self._roots, mode, epoch)
+        worker = ToolDeletionWorker(
+            tools,
+            self._roots,
+            mode,
+            epoch,
+            self._libraries,
+            scan_mapping=self._tool_mapping,
+            scan_contributing_roots=self._contributing_roots,
+        )
         self._workers.add(worker)
         worker.signals.result_ready.connect(self._on_tool_deletion_result)
         worker.signals.finished.connect(lambda ep, w=worker: self._on_tool_deletion_finished(ep, w))
+        self._status.showMessage(f"Deleting 0/{self._tools_delete_total}")
         QThreadPool.globalInstance().start(worker)
 
     def _on_tool_deletion_result(self, result: ToolDeletionResult, epoch: int) -> None:
@@ -1074,6 +1278,10 @@ class MainWindow(QMainWindow):
         self._scan_errors.clear()
         self._scan_total = 0
         self._scan_done = 0
+        self._enumeration_warnings.clear()
+        self._discovery_errors.clear()
+        self._tool_errors.clear()
+        self._update_warning_indicator()
         worker = DiscoveryWorker(self._config.custom_roots, epoch)
         self._workers.add(worker)
         worker.signals.finished.connect(
@@ -1091,20 +1299,41 @@ class MainWindow(QMainWindow):
         if epoch != self._epoch:
             return
         result, prefixes = payload
+        has_discovery_crash = any(
+            err.path is None
+            or err.kind is DiscoveryErrorKind.CRASH
+            or err.kind is DiscoveryErrorKind.SYSTEM
+            for err in result.errors
+        )
         self._roots = list(result.roots)
-        self._config.steam_roots = [str(root.path) for root in result.roots]
+        if not has_discovery_crash:
+            self._config.steam_roots = [str(root.path) for root in result.roots]
         self._libraries = list(result.libraries)
         self._tool_mapping, self._tool_errors = load_tool_mapping(self._roots)
+        self._contributing_roots = contributing_roots(self._roots)
         self._model.set_tool_provider(self._tool_for)
-        tools = enumerate_tools(self._roots, self._libraries)
+        tools, enumeration_warnings = enumerate_tools(self._roots, self._libraries)
+        self._enumeration_warnings = list(enumeration_warnings)
+        self._discovery_errors = list(result.errors)
+        for warning in enumeration_warnings:
+            _logger.warning("enumeration warning: %s (%s)", warning.message, warning.path)
+        for err in result.errors:
+            _logger.warning("discovery error: %s (%s)", err.message, err.path)
+        for tool_err in self._tool_errors:
+            _logger.warning("tool mapping error: %s (%s)", tool_err.message, tool_err.path)
         prefix_names: dict[int, str] = {}
         for prefix in prefixes:
             prefix_names.setdefault(prefix.app_id, prefix.name)
-        self._tools_model.set_items(tools, used_by(tools, self._tool_mapping), prefix_names)
+        # A failed mapping load must not mark tools unused, so the model
+        # and the overview classify by usage_known instead.
+        usage_known = not self._tool_errors
+        self._tools_model.set_items(
+            tools, used_by(tools, self._tool_mapping), prefix_names, usage_known=usage_known
+        )
         self._all_tools = list(tools)
         self._apply_tools_filter()
         if tools:
-            size_worker = ToolSizeWorker(tools, epoch)
+            size_worker = ToolSizeWorker(tools, epoch, is_stale=lambda: epoch != self._epoch)
             self._workers.add(size_worker)
             size_worker.signals.sized.connect(self._on_tool_sized)
             size_worker.signals.finished.connect(
@@ -1117,10 +1346,9 @@ class MainWindow(QMainWindow):
                 self._tools_model.mark_pending_unavailable()
         else:
             self._tools_model.mark_pending_unavailable()
-        warning_count = len(result.errors) + len(self._tool_errors)
-        self._warning_count = warning_count
-        if warning_count:
-            self._status.showMessage(f"warnings: {warning_count}", 5000)
+        self._update_warning_indicator()
+        if self._warning_count:
+            self._status.showMessage(f"warnings: {self._warning_count}", 5000)
 
         store = Store()
         store.merge(prefixes)
@@ -1133,10 +1361,11 @@ class MainWindow(QMainWindow):
         self._disk_capacity = storage_capacity(
             [library.path for library in self._libraries]
         ).total_bytes
-        self._overview.update_data(store.prefixes, self._disk_capacity)
+        self._refresh_overview()
 
         if not result.roots:
-            save_config(self._config)
+            if not has_discovery_crash:
+                save_config(self._config)
             self._show_message(_NO_ROOTS_TEXT, locate=True)
             return
         if not store.prefixes:
@@ -1156,7 +1385,9 @@ class MainWindow(QMainWindow):
             return
         self._scan_total = len(pending)
         self._update_progress_text()
-        scan_worker = ScanWorker(pending, self._config.size_cache, epoch)
+        scan_worker = ScanWorker(
+            pending, self._config.size_cache, epoch, is_stale=lambda: epoch != self._epoch
+        )
         self._workers.add(scan_worker)
         scan_worker.signals.scan_event.connect(self._on_scan_event)
         scan_worker.signals.finished.connect(
@@ -1183,7 +1414,7 @@ class MainWindow(QMainWindow):
             self._apply_sort()
         else:
             self._apply_filters(rescan_openable=False)
-        self._overview.update_data(self._store.prefixes, self._disk_capacity)
+        self._refresh_overview()
 
     def _on_scan_finished(self, epoch: int, worker: QRunnable | None = None) -> None:
         self._workers.discard(worker)
@@ -1211,12 +1442,45 @@ class MainWindow(QMainWindow):
             self._tools_model.set_tool_size(path, size_bytes, error)
             if self._tools_sort_key == "size":
                 self._apply_tools_filter()
+            self._tools_overview_timer.start()
 
     def _on_tool_size_finished(self, epoch: int, worker: QRunnable | None = None) -> None:
         self._workers.discard(worker)
         if epoch != self._epoch:
             return
         self._tools_model.mark_pending_unavailable()
+        self.flush_tools_overview_refresh()
+
+    def _refresh_overview(self) -> None:
+        """Push prefixes and tools into the passive overview page."""
+        # The full refresh already covers the tools section, so any
+        # pending debounced refresh would only repeat the same rebuild.
+        self._tools_overview_timer.stop()
+        self._overview.update_data(
+            self._store.prefixes,
+            self._disk_capacity,
+            self._all_tools,
+            self._tools_model.used,
+            self._tools_model.pending,
+            self._tools_model.failed,
+            self._tools_model.usage_known,
+        )
+
+    def _refresh_tools_overview(self) -> None:
+        """Refresh only the tools section after one async size result."""
+        self._overview.update_tools(
+            self._all_tools,
+            self._tools_model.used,
+            self._tools_model.pending,
+            self._tools_model.failed,
+            self._disk_capacity,
+            self._tools_model.usage_known,
+        )
+
+    def flush_tools_overview_refresh(self) -> None:
+        """Run a pending debounced tools overview refresh immediately."""
+        self._tools_overview_timer.stop()
+        self._refresh_tools_overview()
 
     def _on_sort_column_clicked(self, section: int) -> None:
         key = SORTABLE_COLUMNS.get(section)
@@ -1251,7 +1515,7 @@ class MainWindow(QMainWindow):
         save_config(self._config)
 
     def _set_page(self, index: int) -> None:
-        """Switch between the Overview and Prefixes tabs."""
+        """Switch between the Overview, Prefixes, and Tools tabs."""
         self._tabs.setCurrentIndex(index)
 
     def _on_prefix_focus_requested(self, prefix: object) -> None:
@@ -1270,6 +1534,61 @@ class MainWindow(QMainWindow):
         self._set_type_filter({PrefixType.ORPHANED})
         self._set_page(_PAGE_PREFIXES)
         self._run_pending_handoff()
+
+    def _on_tool_focus_requested(self, tool: object) -> None:
+        if not isinstance(tool, Tool):
+            return
+        self._clear_tools_search()
+        used = self._tools_model.used
+        facets = _tool_facets(tool, used, usage_known=self._tools_model.usage_known)
+        if not facets & self._tools_statuses:
+            self._set_tools_status_filter(set(_TOOL_STATUS_FILTERS))
+        else:
+            self._apply_tools_filter()
+        self._set_page(_PAGE_TOOLS)
+        target = str(tool.path)
+        rows = self._tools_model.rows()
+        row = next((r for r, t in enumerate(rows) if str(t.path) == target), None)
+        if row is None:
+            return
+        self._tools_model.highlight_row(rows[row])
+        self._pending_tool_focus_path = target
+        self._tools_scroll_timer.start(0)
+
+    def _scroll_to_pending_tool(self) -> None:
+        # The model may reset between the focus call and this deferred
+        # scroll (search debounce, size-result re-sort), so the row is
+        # re-resolved from the path at fire time. A removed row must
+        # not scroll to whatever replaced it.
+        target = self._pending_tool_focus_path
+        self._pending_tool_focus_path = None
+        if target is None:
+            return
+        rows = self._tools_model.rows()
+        row = next((r for r, t in enumerate(rows) if str(t.path) == target), None)
+        if row is None:
+            return
+        self._tools_table.scrollTo(
+            self._tools_model.index(row, _TOOL_NAME_COLUMN),
+            QAbstractItemView.ScrollHint.PositionAtCenter,
+        )
+
+    def _set_tools_status_filter(self, statuses: set[str]) -> None:
+        """Replace the active tools status filter and sync the menu."""
+        self._tools_statuses = set(statuses)
+        for label, action in self._tools_status_actions.items():
+            action.blockSignals(True)
+            action.setChecked(label in self._tools_statuses)
+            action.blockSignals(False)
+        self._update_tools_status_summary()
+        self._apply_tools_filter()
+
+    def _on_tool_review_requested(self) -> None:
+        # Show only removable tools. The search box is cleared first so a
+        # stale query cannot leave the filtered view empty.
+        self._clear_tools_search()
+        self._set_tools_status_filter({_TOOL_STATUS_UNUSED})
+        self._set_page(_PAGE_TOOLS)
 
     def _run_pending_handoff(self) -> None:
         """Carry handoff intent through the window, never through route parameters."""
@@ -1369,5 +1688,11 @@ class MainWindow(QMainWindow):
         return tool or None
 
     def closeEvent(self, event) -> None:
+        # A pending debounced refresh must not fire after the workers are
+        # gone, so the timer is dropped before the thread pool drains.
+        self._tools_overview_timer.stop()
+        self._tools_scroll_timer.stop()
+        self._pending_tool_focus_path = None
+        self._epoch += 1
         QThreadPool.globalInstance().waitForDone(_SCAN_WAIT_MS)
         super().closeEvent(event)

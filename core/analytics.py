@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from core.models import Prefix, PrefixType, ScanStatus
+from core.tools import Tool, ToolCategory, tool_category
 
 
 @dataclass(slots=True)
@@ -20,6 +21,15 @@ class ClassificationTotals:
     """Count and total size of one classification."""
 
     prefix_type: PrefixType
+    count: int
+    size_bytes: int
+
+
+@dataclass(slots=True)
+class ToolCategoryTotals:
+    """Count and total size of one tool use category."""
+
+    category: ToolCategory
     count: int
     size_bytes: int
 
@@ -41,6 +51,35 @@ def classification_totals(prefixes: Sequence[Prefix]) -> list[ClassificationTota
         entry.count += 1
         entry.size_bytes += prefix.size_bytes
     return [buckets[PrefixType.STEAM], buckets[PrefixType.NON_STEAM], buckets[PrefixType.ORPHANED]]
+
+
+def tool_category_totals(
+    tools: Sequence[Tool],
+    used: set[str],
+    *,
+    usage_known: bool,
+) -> list[ToolCategoryTotals]:
+    """Per-category counts and sizes for tools, always including all four.
+
+    With usage_known False, tools that are neither used nor read-only
+    count as Unknown instead of Reclaimable, so a failed mapping load
+    never reports in-use tools as reclaimable. A writable tool whose own
+    compatibilitytool.vdf could not be read counts as Unknown too, since
+    the mapping may select the display name that tool could not resolve.
+    """
+    buckets: dict[ToolCategory, ToolCategoryTotals] = {
+        category: ToolCategoryTotals(category, 0, 0) for category in ToolCategory
+    }
+    for tool in tools:
+        entry = buckets[tool_category(tool, used, usage_known=usage_known)]
+        entry.count += 1
+        entry.size_bytes += tool.size_bytes
+    return [
+        buckets[ToolCategory.USED],
+        buckets[ToolCategory.RECLAIMABLE],
+        buckets[ToolCategory.READ_ONLY],
+        buckets[ToolCategory.UNKNOWN],
+    ]
 
 
 def total_size(prefixes: Sequence[Prefix]) -> int:

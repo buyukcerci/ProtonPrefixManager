@@ -23,6 +23,9 @@ from pathlib import Path
 
 from core.models import Prefix, ScanStatus
 
+MAX_SCAN_FILES = 500_000
+MAX_SCAN_BYTES = 1 << 40
+
 
 class ScanEventKind(StrEnum):
     """Kind of a scan progress event.
@@ -178,23 +181,51 @@ def refresh_needed(cache: dict[str, dict], prefix: Prefix, force: bool = False) 
     return not _is_usable_entry(entry)
 
 
-def scan_prefix(path: Path) -> ScanResult:
+def _safe_timestamp(timestamp: float | None) -> datetime | None:
+    if timestamp is None:
+        return None
+    try:
+        return datetime.fromtimestamp(timestamp, tz=UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def scan_prefix(
+    path: Path,
+    *,
+    max_files: int = MAX_SCAN_FILES,
+    max_bytes: int = MAX_SCAN_BYTES,
+    should_stop: Callable[[], bool] | None = None,
+) -> ScanResult:
     """Recursively total regular-file bytes under path without following symlinks.
 
     Symlinked files and directories are skipped entirely, so a link pointing
     outside the prefix can never inflate the total. Unreadable or vanishing
     entries are ignored; only a failure on the root itself yields an error
-    result instead of raising.
+    result instead of raising. File-count and byte budgets bound runaway
+    trees: the walk stops early and returns the partial total with a
+    truncated error so callers report FAILED instead of a false complete
+    total. A true should_stop callback aborts the walk with a cancelled
+    error so the caller can report FAILED instead of a false complete
+    total. The callback is polled once per directory and every 1000
+    entries inside large directories to keep cancellation responsive.
     """
     try:
         root_entries = _listdir(path)
     except OSError as exc:
         return ScanResult(path=path, size_bytes=0, error=str(exc))
     total = 0
+    file_count = 0
+    entry_count = 0
     newest_mtime: float | None = None
     stack: list[list[os.DirEntry[str]]] = [root_entries]
     while stack:
+        if should_stop is not None and should_stop():
+            return ScanResult(path=path, size_bytes=total, error="cancelled")
         for entry in stack.pop():
+            entry_count += 1
+            if entry_count % 1000 == 0 and should_stop is not None and should_stop():
+                return ScanResult(path=path, size_bytes=total, error="cancelled")
             try:
                 info = entry.stat(follow_symlinks=False)
             except OSError:
@@ -203,6 +234,13 @@ def scan_prefix(path: Path) -> ScanResult:
             if stat_module.S_ISLNK(mode):
                 continue
             if stat_module.S_ISDIR(mode):
+                file_count += 1
+                if file_count >= max_files:
+                    stack.clear()
+                    cut_modified = _safe_timestamp(newest_mtime)
+                    return ScanResult(
+                        path=path, size_bytes=total, error="truncated", modified=cut_modified
+                    )
                 child = Path(entry.path)
                 try:
                     stack.append(_listdir(child))
@@ -210,9 +248,16 @@ def scan_prefix(path: Path) -> ScanResult:
                     continue
             elif stat_module.S_ISREG(mode):
                 total += info.st_size
+                file_count += 1
                 if newest_mtime is None or info.st_mtime > newest_mtime:
                     newest_mtime = info.st_mtime
-    modified = datetime.fromtimestamp(newest_mtime, tz=UTC) if newest_mtime is not None else None
+                if file_count >= max_files or total >= max_bytes:
+                    stack.clear()
+                    cut_modified = _safe_timestamp(newest_mtime)
+                    return ScanResult(
+                        path=path, size_bytes=total, error="truncated", modified=cut_modified
+                    )
+    modified = _safe_timestamp(newest_mtime)
     return ScanResult(path=path, size_bytes=total, error=None, modified=modified)
 
 
@@ -222,6 +267,7 @@ def scan_prefixes(
     *,
     on_event: Callable[[ScanEvent], None] | None = None,
     force_refresh: bool = False,
+    should_stop: Callable[[], bool] | None = None,
 ) -> Iterable[ScanEvent]:
     """Lazily scan prefixes in order, emitting STARTED then COMPLETED or FAILED.
 
@@ -230,10 +276,34 @@ def scan_prefixes(
     events are delivered through it instead of being yielded. Valid cache
     hits are reported as completed without walking the disk unless
     force_refresh is set. The input sequence is never mutated; attach the
-    refreshed Prefix from each terminal event via Store.upsert.
+    refreshed Prefix from each terminal event via Store.upsert. When
+    should_stop reports true the remaining work ends with FAILED events
+    carrying a cancelled error instead of partial totals.
     """
     for prefix in prefixes:
-        for event in _scan_one(prefix, cache, force_refresh=force_refresh):
+        if should_stop is not None and should_stop():
+            event = ScanEvent(
+                kind=ScanEventKind.FAILED,
+                prefix=replace(prefix, scan_status=ScanStatus.FAILED),
+                error="cancelled",
+            )
+            if on_event is not None:
+                on_event(event)
+            else:
+                yield event
+            return
+        for event in _scan_one(prefix, cache, force_refresh=force_refresh, should_stop=should_stop):
+            if should_stop is not None and should_stop():
+                cancelled = ScanEvent(
+                    kind=ScanEventKind.FAILED,
+                    prefix=replace(prefix, scan_status=ScanStatus.FAILED),
+                    error="cancelled",
+                )
+                if on_event is not None:
+                    on_event(cancelled)
+                else:
+                    yield cancelled
+                return
             if on_event is not None:
                 on_event(event)
             else:
@@ -245,6 +315,7 @@ def _scan_one(
     cache: dict[str, dict] | None,
     *,
     force_refresh: bool,
+    should_stop: Callable[[], bool] | None = None,
 ) -> Iterator[ScanEvent]:
     yield ScanEvent(kind=ScanEventKind.STARTED, prefix=prefix)
     if cache is not None and not force_refresh:
@@ -254,7 +325,7 @@ def _scan_one(
                 kind=ScanEventKind.COMPLETED, prefix=cached, size_bytes=cached.size_bytes
             )
             return
-    result = scan_prefix(prefix.path)
+    result = scan_prefix(prefix.path, should_stop=should_stop)
     if result.error is not None:
         yield ScanEvent(
             kind=ScanEventKind.FAILED,

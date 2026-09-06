@@ -18,6 +18,7 @@ from core.models import Prefix, PrefixType, ScanStatus, format_size
 from core.scanner import (
     CacheEntry,
     ScanEventKind,
+    ScanResult,
     cache_key,
     invalidate,
     load_cached,
@@ -477,3 +478,77 @@ def test_scan_events_carry_modified(tmp_path: Path) -> None:
     assert isinstance(completed, Prefix)
     assert completed.modified is not None
     assert abs(completed.modified.timestamp() - newest.timestamp()) < 1
+
+
+def test_safe_timestamp() -> None:
+    from core.scanner import _safe_timestamp
+
+    assert _safe_timestamp(None) is None
+    dt = _safe_timestamp(1700000000.0)
+    assert dt is not None
+    assert dt.tzinfo == UTC
+    assert dt == datetime.fromtimestamp(1700000000.0, tz=UTC)
+    assert _safe_timestamp(1e25) is None
+    assert _safe_timestamp(-1e25) is None
+
+
+def test_directory_entries_counted_against_max_files(tmp_path: Path) -> None:
+    target = tmp_path / "tree"
+    target.mkdir()
+    (target / "dir1").mkdir()
+    (target / "dir2").mkdir()
+    (target / "dir3").mkdir()
+    result = scan_prefix(target, max_files=2)
+    assert result.error == "truncated"
+    assert result.size_bytes == 0
+
+
+def test_save_cached_without_timestamp_fails_closed(tmp_path: Path) -> None:
+    prefix = _make_prefix(tmp_path)
+    assert prefix.last_scanned is None
+    with pytest.raises(ValueError):
+        save_cached({}, prefix)
+
+
+def test_scan_truncation_reports_failed_and_skips_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prefix = _make_prefix(tmp_path)
+    _write_file(prefix.path / "a.bin", 10)
+    _write_file(prefix.path / "b.bin", 10)
+    result = scan_prefix(prefix.path, max_files=1)
+    assert result.error == "truncated"
+    cache: dict[str, dict] = {}
+
+    def fake_scan(path: Path, **kwargs: object) -> ScanResult:
+        return ScanResult(path=path, size_bytes=20, error="truncated")
+
+    monkeypatch.setattr(scanner_module, "scan_prefix", fake_scan)
+    events = list(scan_prefixes([prefix], cache, force_refresh=True))
+    assert events[-1].kind is ScanEventKind.FAILED
+    assert events[-1].error == "truncated"
+    assert cache_key(prefix) not in cache
+
+
+def test_scan_should_stop_between_prefixes(tmp_path: Path) -> None:
+    first = _make_prefix(tmp_path, "a", app_id=1)
+    second = _make_prefix(tmp_path, "b", app_id=2)
+    calls = {"count": 0}
+
+    def should_stop() -> bool:
+        calls["count"] += 1
+        return calls["count"] > 2
+
+    events = list(scan_prefixes([first, second], None, should_stop=should_stop))
+    assert any(
+        event.kind is ScanEventKind.FAILED and event.error == "cancelled" for event in events
+    )
+
+
+def test_scan_should_stop_inside_walk(tmp_path: Path) -> None:
+    target = tmp_path / "big"
+    target.mkdir()
+    for index in range(20):
+        _write_file(target / f"f{index}.bin", 5)
+    result = scan_prefix(target, should_stop=lambda: True)
+    assert result.error == "cancelled"

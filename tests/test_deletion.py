@@ -12,6 +12,7 @@ from core.deletion import (
     DeletionStatus,
     FailureKind,
     RejectReason,
+    _final_check,
     compatdata_path,
     delete_prefixes,
 )
@@ -298,3 +299,53 @@ def test_second_library_in_current_set_accepted(tmp_path: Path, trash_calls: lis
 def test_compatdata_path_helper(tmp_path: Path) -> None:
     library, compatdata = _make_library(tmp_path)
     assert compatdata_path(library) == compatdata.resolve()
+
+
+def test_delete_rejects_conflicting_aliases(tmp_path: Path, trash_calls: list[Path]) -> None:
+    library, compatdata = _make_library(tmp_path)
+    prefix_valid = _make_prefix(compatdata, app_id=480)
+    prefix_conflict = Prefix(
+        app_id=999,
+        name="Conflicting Game",
+        prefix_type=PrefixType.STEAM,
+        path=compatdata / "480",
+        library=str(compatdata.parent.parent),
+    )
+    results = delete_prefixes([prefix_valid, prefix_conflict], [library])
+    assert len(results) == 1
+    assert results[0].status is DeletionStatus.REJECTED
+    assert results[0].reject_reason is RejectReason.NAME_MISMATCH
+    assert trash_calls == []
+    assert (compatdata / "480").is_dir()
+
+
+def test_delete_rejects_unexpanded_name_mismatch(tmp_path: Path, trash_calls: list[Path]) -> None:
+    library, compatdata = _make_library(tmp_path)
+    target = compatdata / "480"
+    target.mkdir(exist_ok=True)
+    sub = target / "sub"
+    sub.mkdir()
+    prefix = Prefix(
+        app_id=480,
+        name="Game",
+        prefix_type=PrefixType.STEAM,
+        path=sub / "..",
+        library=str(compatdata.parent.parent),
+    )
+    results = delete_prefixes([prefix], [library])
+    assert len(results) == 1
+    assert results[0].status is DeletionStatus.REJECTED
+    assert results[0].reject_reason is RejectReason.NAME_MISMATCH
+    assert trash_calls == []
+    assert target.is_dir()
+
+
+def test_final_check_symlink_swap_rejected(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "linkdir"
+    link.symlink_to(real)
+    assert _final_check(link) is RejectReason.SYMLINK
+    missing = tmp_path / "gone"
+    assert _final_check(missing) is RejectReason.MISSING
+    assert _final_check(real) is None

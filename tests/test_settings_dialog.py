@@ -5,8 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from PySide6.QtGui import QFontDatabase
-from PySide6.QtWidgets import QDialog, QDialogButtonBox
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QFontDatabase, QValidator
+from PySide6.QtWidgets import QDialog, QDialogButtonBox, QMessageBox
 
 from core.config import AppConfig
 from core.discovery import Library, RootSource, SteamRoot
@@ -53,6 +54,12 @@ def _fake_picker(
 
 def _captured_warnings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     messages: list[str] = []
+
+    def fake_exec(self: QMessageBox) -> int:
+        messages.append(self.text())
+        return int(QMessageBox.StandardButton.Ok)
+
+    monkeypatch.setattr("ui.settings.QMessageBox.exec", fake_exec)
     monkeypatch.setattr(
         "ui.settings.QMessageBox.warning",
         lambda parent, title, text: messages.append(text),
@@ -238,6 +245,15 @@ def test_font_size_above_range_clamps_to_maximum(qtbot) -> None:
     assert spin.value() == MAX_FONT_SIZE
 
 
+def test_font_size_unicode_digits_do_not_crash_spinbox(qtbot) -> None:
+    dialog = _dialog(AppConfig(font_size=10))
+    qtbot.addWidget(dialog)
+    spin = dialog._font_size_spin
+    assert spin.valueFromText("²") == 10
+    state, text, pos = spin.validate("² pt", 0)
+    assert state != QValidator.State.Acceptable
+
+
 def test_font_size_spin_suffix_tooltip_and_tracking(qtbot) -> None:
     dialog = _dialog(AppConfig())
     qtbot.addWidget(dialog)
@@ -364,3 +380,22 @@ def test_focus_add_root_seeds_keyboard_focus_on_add_button(qtbot) -> None:
     qtbot.waitExposed(dialog)
     qtbot.waitUntil(lambda: dialog._add_button.hasFocus())
     assert dialog._tabs.currentIndex() == 0
+
+
+def test_warn_uses_plain_text_format(monkeypatch: pytest.MonkeyPatch) -> None:
+    dialog = _dialog()
+    captured_box: list[QMessageBox] = []
+
+    def fake_exec(self: QMessageBox) -> int:
+        captured_box.append(self)
+        return int(QMessageBox.StandardButton.Ok)
+
+    monkeypatch.setattr("ui.settings.QMessageBox.exec", fake_exec)
+    raw_path = "/path/with/<special>&tags/test"
+    dialog._warn(raw_path)
+    assert len(captured_box) == 1
+    box = captured_box[0]
+    assert box.textFormat() == Qt.TextFormat.PlainText
+    assert box.text() == raw_path
+    assert box.icon() == QMessageBox.Icon.Warning
+    assert box.windowTitle() == "Settings"
