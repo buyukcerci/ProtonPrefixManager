@@ -639,10 +639,11 @@ def test_all_filters_off_yields_empty_view(qtbot, isolated_env: Path) -> None:
 def test_main_window_has_settings_style_tabs(qtbot, isolated_env: Path) -> None:
     window = MainWindow(auto_start=False)
     qtbot.addWidget(window)
-    assert window._tabs.count() == 3
+    assert window._tabs.count() == 4
     assert window._tabs.tabText(0) == "Overview"
     assert window._tabs.tabText(1) == "Prefixes"
     assert window._tabs.tabText(2) == "Tools"
+    assert window._tabs.tabText(3) == "Shaders"
     assert window._tabs.currentIndex() == _PAGE_OVERVIEW
     assert window._delete_tools_button.text() == "Delete Tools (0)"
     assert not window._delete_tools_button.isEnabled()
@@ -684,7 +685,7 @@ def test_discovery_populates_tools_tab(qtbot, isolated_env: Path) -> None:
         encoding="utf-8",
     )
     window._on_discovery_finished((result, prefixes), window._epoch)
-    assert window._tabs.count() == 3
+    assert window._tabs.count() == 4
     window._set_page(_PAGE_TOOLS)
     assert window._tabs.currentIndex() == _PAGE_TOOLS
     model = window._tools_model

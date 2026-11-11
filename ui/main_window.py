@@ -69,6 +69,7 @@ from core.scanner import (
     record_scan,
     refresh_needed,
 )
+from core.shaders import enumerate_shader_caches
 from core.toolmap import ToolMapError, contributing_roots, load_tool_mapping, tool_name_for
 from core.tools import (
     SYSTEM_TOOLS_DIR,
@@ -88,6 +89,7 @@ from ui.dialogs import (
 from ui.overview import OverviewPage
 from ui.sanitize import sanitize_display, sanitize_tooltip
 from ui.settings import SettingsDialog
+from ui.shaders_page import ShadersPage
 from ui.styles import (
     CHECK_WIDTH_PX,
     HIGHLIGHT_DURATION_MS,
@@ -98,6 +100,7 @@ from ui.styles import (
     TOOLS_OVERVIEW_DEBOUNCE_MS,
     SecondaryLabel,
     apply_app_style,
+    set_message_content,
 )
 from ui.table import (
     OPEN_COLUMN,
@@ -124,6 +127,7 @@ _PAGE_CONTENT = 1
 _PAGE_OVERVIEW = 0
 _PAGE_PREFIXES = 1
 _PAGE_TOOLS = 2
+_PAGE_SHADERS = 3
 
 _INNER_PAGE_MESSAGE = 0
 _INNER_PAGE_TABLE = 1
@@ -210,14 +214,6 @@ def _tool_facets(tool: Tool, used: set[str], *, usage_known: bool) -> set[str]:
         unknown = not usage_known or tool.name_unverified
         facets.add(_TOOL_STATUS_UNKNOWN if unknown else _TOOL_STATUS_UNUSED)
     return facets
-
-
-def _set_message_content(icon_label: QLabel, text_label: QLabel, text: str) -> None:
-    """Set message text plus the shared information icon."""
-    text_label.setText(text)
-    if QApplication.instance() is not None:
-        icon = QApplication.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation)
-        icon_label.setPixmap(icon.pixmap(MESSAGE_ICON_SIZE_PX, MESSAGE_ICON_SIZE_PX))
 
 
 class ToolTableModel(QAbstractTableModel):
@@ -606,6 +602,15 @@ class MainWindow(QMainWindow):
         self._table = PrefixTable(self._model)
         self._store = self._model.store
         self._tools_model = ToolTableModel()
+        # Created before the other tabs: their delete buttons consult
+        # _any_deleting() while being built.
+        self._shaders_page = ShadersPage(
+            epoch_provider=lambda: self._epoch,
+            external_busy=lambda: self._deleting or self._tools_deleting,
+        )
+        self._shaders_page.busy_changed.connect(self._on_shaders_busy_changed)
+        self._shaders_page.status_message.connect(self._status_message)
+        self._shaders_page.deletion_finished.connect(self.refresh)
 
         self._message_icon_label = QLabel()
         self._message_icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -693,6 +698,7 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._overview, "Overview")
         self._tabs.addTab(prefixes_page, "Prefixes")
         self._tabs.addTab(self._build_tools_page(), "Tools")
+        self._tabs.addTab(self._shaders_page, "Shaders")
 
         content = QWidget()
         content_layout = QVBoxLayout(content)
@@ -922,9 +928,8 @@ class MainWindow(QMainWindow):
     def _update_delete_tools_button(self) -> None:
         count = len(self._tools_model.selected_tools())
         self._delete_tools_button.setText(f"Delete Tools ({count})")
-        self._delete_tools_button.setEnabled(
-            count > 0 and not self._tools_deleting and not self._deleting
-        )
+        self._delete_tools_button.setEnabled(count > 0 and not self._any_deleting())
+        self._shaders_page.update_delete_button()
 
     def _on_tools_selection_changed(self) -> None:
         self._update_delete_tools_button()
@@ -1059,7 +1064,7 @@ class MainWindow(QMainWindow):
 
     def _on_delete_tools_clicked(self) -> None:
         tools = self._tools_model.selected_tools()
-        if not tools or self._tools_deleting or self._deleting:
+        if not tools or self._any_deleting():
             return
         # The used set is re-resolved inside the deletion worker from a
         # mapping loaded at run time, so a tool selected by a game after
@@ -1116,7 +1121,7 @@ class MainWindow(QMainWindow):
         self._workers.discard(worker)
         if epoch != self._epoch:
             self._tools_deleting = False
-            if not self._deleting and not self._tools_deleting:
+            if not self._any_deleting():
                 self._refresh_action.setEnabled(True)
             self._update_delete_button()
             self._update_delete_tools_button()
@@ -1125,7 +1130,7 @@ class MainWindow(QMainWindow):
             return
         results = list(self._tools_deletion_results)
         self._tools_deleting = False
-        if not self._deleting and not self._tools_deleting:
+        if not self._any_deleting():
             self._refresh_action.setEnabled(True)
         self._update_delete_button()
         self._update_delete_tools_button()
@@ -1133,6 +1138,21 @@ class MainWindow(QMainWindow):
         if any(result.status is not DeletionStatus.DELETED for result in results):
             show_deletion_summary(self, results)
         self.refresh()
+
+    def _any_deleting(self) -> bool:
+        """True while any tab's deletion batch is running."""
+        return self._deleting or self._tools_deleting or self._shaders_page.is_deleting
+
+    def _on_shaders_busy_changed(self, busy: bool) -> None:
+        self._refresh_action.setEnabled(not self._any_deleting())
+        self._update_delete_button()
+        self._update_delete_tools_button()
+
+    def _status_message(self, text: str, timeout_ms: int) -> None:
+        if text:
+            self._status.showMessage(text, timeout_ms)
+        else:
+            self._status.clearMessage()
 
     def _type_summary_text(self) -> str:
         checked = [
@@ -1205,13 +1225,11 @@ class MainWindow(QMainWindow):
     def _update_delete_button(self) -> None:
         count = len(self._store.selected())
         self._delete_button.setText(f"Delete Prefixes ({count})")
-        self._delete_button.setEnabled(
-            count > 0 and not self._deleting and not self._tools_deleting
-        )
+        self._delete_button.setEnabled(count > 0 and not self._any_deleting())
 
     def _on_delete_clicked(self) -> None:
         selected = self._store.selected()
-        if not selected or self._deleting or self._tools_deleting:
+        if not selected or self._any_deleting():
             return
         names, total_text = self._selected_summary()
         if not confirm_selection(self, names, total_text, unscanned_note_for(selected)):
@@ -1246,7 +1264,7 @@ class MainWindow(QMainWindow):
         self._workers.discard(worker)
         if epoch != self._epoch:
             self._deleting = False
-            if not self._deleting and not self._tools_deleting:
+            if not self._any_deleting():
                 self._refresh_action.setEnabled(True)
             self._update_delete_button()
             self._update_delete_tools_button()
@@ -1259,7 +1277,7 @@ class MainWindow(QMainWindow):
                 invalidate(self._config.size_cache, result.prefix)
         save_config(self._config)
         self._deleting = False
-        if not self._deleting and not self._tools_deleting:
+        if not self._any_deleting():
             self._refresh_action.setEnabled(True)
         self._update_delete_button()
         self._update_delete_tools_button()
@@ -1320,7 +1338,7 @@ class MainWindow(QMainWindow):
 
     def refresh(self) -> None:
         """Start one full pipeline run; stale runs are dropped via the epoch."""
-        if self._deleting or self._tools_deleting:
+        if self._any_deleting():
             return
         self._epoch += 1
         epoch = self._epoch
@@ -1366,12 +1384,16 @@ class MainWindow(QMainWindow):
         # Prefix enumeration and deletion refuse symlinked steamapps or
         # compatdata directories; say so instead of showing an empty library.
         for link in symlinked_compatdata_paths(self._libraries):
+            contents = "prefixes and shader caches" if link.name == "steamapps" else "prefixes"
             self._enumeration_warnings.append(
                 EnumerationWarning(
-                    message="symlinked Steam directory skipped; its prefixes are not listed",
+                    message=f"symlinked Steam directory skipped; its {contents} are not listed",
                     path=link,
                 )
             )
+        shader_caches, shader_warnings = enumerate_shader_caches(self._libraries, self._roots)
+        self._enumeration_warnings.extend(shader_warnings)
+        self._shaders_page.set_data(shader_caches, self._libraries)
         self._discovery_errors = list(result.errors)
         for warning in self._enumeration_warnings:
             _logger.warning("enumeration warning: %s (%s)", warning.message, warning.path)
@@ -1721,17 +1743,17 @@ class MainWindow(QMainWindow):
         header.setSortIndicator(section, order)
 
     def _show_message(self, text: str, *, locate: bool = False) -> None:
-        _set_message_content(self._message_icon_label, self._message_label, text)
+        set_message_content(self._message_icon_label, self._message_label, text)
         self._locate_button.setVisible(locate)
         if locate:
             self._locate_button.setFocus()
         self._stack.setCurrentIndex(_PAGE_MESSAGE)
 
     def _show_inner_message(self, text: str) -> None:
-        _set_message_content(self._inner_message_icon_label, self._inner_message_label, text)
+        set_message_content(self._inner_message_icon_label, self._inner_message_label, text)
 
     def _show_tools_message(self, text: str) -> None:
-        _set_message_content(self._tools_message_icon_label, self._tools_message_label, text)
+        set_message_content(self._tools_message_icon_label, self._tools_message_label, text)
 
     def _update_progress_text(self) -> None:
         if self._scan_total <= 0:
@@ -1750,6 +1772,7 @@ class MainWindow(QMainWindow):
         # gone, so the timer is dropped before the thread pool drains.
         self._tools_overview_timer.stop()
         self._tools_scroll_timer.stop()
+        self._shaders_page.stop()
         self._pending_tool_focus_path = None
         self._epoch += 1
         QThreadPool.globalInstance().waitForDone(_SCAN_WAIT_MS)

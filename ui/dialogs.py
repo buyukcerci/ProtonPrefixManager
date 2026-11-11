@@ -27,6 +27,7 @@ from core.deletion import (
     ToolDeletionResult,
 )
 from core.models import Prefix, ScanStatus
+from core.shaders import ShaderCache
 from core.tools import Tool
 from ui.sanitize import sanitize_display
 
@@ -184,12 +185,17 @@ def unscanned_note_for(prefixes: Sequence[Prefix]) -> str | None:
 
 
 def tools_pending_note_for(
-    tools: Sequence[Tool], pending: set[str], failed: set[str] | None = None
+    tools: Sequence[Tool] | Sequence[ShaderCache],
+    pending: set[str],
+    failed: set[str] | None = None,
+    noun: str = "tool",
 ) -> str | None:
-    """Note shown when any selected tool still awaits its size or failed to size."""
+    """Note shown when any selected item still awaits its size or failed to size."""
     paths = {str(tool.path) for tool in tools}
     if paths & (failed or set()):
-        return "Some tool sizes could not be measured and count as 0; the total may be understated."
+        return (
+            f"Some {noun} sizes could not be measured and count as 0; the total may be understated."
+        )
     if paths & pending:
-        return "Some tool sizes have not been measured yet; the total may be understated."
+        return f"Some {noun} sizes have not been measured yet; the total may be understated."
     return None

@@ -12,7 +12,7 @@ import zlib
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QPainter, QPalette
-from PySide6.QtWidgets import QApplication, QLabel, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QStyle, QWidget
 
 from core.config import AppConfig
 from core.models import PrefixType
@@ -228,6 +228,14 @@ def apply_app_style(app: QApplication, config: AppConfig) -> None:
     app.setFont(font)
     app.setStyleSheet(STYLESHEET)
     _ensure_visible_alternate_base(app)
+
+
+def set_message_content(icon_label: QLabel, text_label: QLabel, text: str) -> None:
+    """Set an empty-state message's text plus the shared information icon."""
+    text_label.setText(text)
+    if QApplication.instance() is not None:
+        icon = QApplication.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation)
+        icon_label.setPixmap(icon.pixmap(MESSAGE_ICON_SIZE_PX, MESSAGE_ICON_SIZE_PX))
 
 
 class SecondaryLabel(QLabel):
