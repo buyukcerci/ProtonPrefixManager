@@ -834,7 +834,6 @@ class ToolTopRow(RankedRow):
     ) -> None:
         category = tool_category(tool, used_set or set(), usage_known=usage_known)
         super().__init__(rank, tool, tool.name, category, size_text, parent)
-        self._tool = tool
 
 
 class RankedListWidget(QFrame):

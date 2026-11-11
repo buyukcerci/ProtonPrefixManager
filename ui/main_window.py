@@ -69,7 +69,7 @@ from core.scanner import (
     record_scan,
     refresh_needed,
 )
-from core.shaders import ShaderCache, enumerate_shader_caches
+from core.shaders import ShaderCache
 from core.toolmap import ToolMapError, contributing_roots, load_tool_mapping, tool_name_for
 from core.tools import (
     SYSTEM_TOOLS_DIR,
@@ -115,6 +115,7 @@ from ui.workers import (
     DiscoveryWorker,
     OpenFolderWorker,
     ScanWorker,
+    ShaderEnumerationWorker,
     ToolDeletionWorker,
     ToolSizeWorker,
 )
@@ -936,7 +937,6 @@ class MainWindow(QMainWindow):
         count = len(self._tools_model.selected_tools())
         self._delete_tools_button.setText(f"Delete Tools ({count})")
         self._delete_tools_button.setEnabled(count > 0 and not self._any_deleting())
-        self._shaders_page.update_delete_button()
 
     def _on_tools_selection_changed(self) -> None:
         self._update_delete_tools_button()
@@ -1098,9 +1098,7 @@ class MainWindow(QMainWindow):
         self._tools_delete_done = 0
         self._tools_deletion_results.clear()
         self._tools_delete_mode = mode
-        self._update_delete_button()
-        self._update_delete_tools_button()
-        self._refresh_action.setEnabled(False)
+        self._update_busy_state()
         epoch = self._epoch
         worker = ToolDeletionWorker(
             tools,
@@ -1128,19 +1126,13 @@ class MainWindow(QMainWindow):
         self._workers.discard(worker)
         if epoch != self._epoch:
             self._tools_deleting = False
-            if not self._any_deleting():
-                self._refresh_action.setEnabled(True)
-            self._update_delete_button()
-            self._update_delete_tools_button()
+            self._update_busy_state()
             if self._status.currentMessage().startswith("Deleting"):
                 self._status.clearMessage()
             return
         results = list(self._tools_deletion_results)
         self._tools_deleting = False
-        if not self._any_deleting():
-            self._refresh_action.setEnabled(True)
-        self._update_delete_button()
-        self._update_delete_tools_button()
+        self._update_busy_state()
         self._status.clearMessage()
         if any(result.status is not DeletionStatus.DELETED for result in results):
             show_deletion_summary(self, results)
@@ -1150,10 +1142,19 @@ class MainWindow(QMainWindow):
         """True while any tab's deletion batch is running."""
         return self._deleting or self._tools_deleting or self._shaders_page.is_deleting
 
-    def _on_shaders_busy_changed(self, busy: bool) -> None:
-        self._refresh_action.setEnabled(not self._any_deleting())
+    def _update_busy_state(self) -> None:
+        """Lock or unlock every delete button and Refresh from _any_deleting().
+
+        Called wherever a tab's deleting flag flips, so the three tabs'
+        buttons and the Refresh action never disagree about who is busy.
+        """
         self._update_delete_button()
         self._update_delete_tools_button()
+        self._shaders_page.update_delete_button()
+        self._refresh_action.setEnabled(not self._any_deleting())
+
+    def _on_shaders_busy_changed(self, busy: bool) -> None:
+        self._update_busy_state()
 
     def _status_message(self, text: str, timeout_ms: int) -> None:
         if text:
@@ -1249,9 +1250,7 @@ class MainWindow(QMainWindow):
         self._delete_done = 0
         self._deletion_results.clear()
         self._delete_mode = mode
-        self._update_delete_button()
-        self._update_delete_tools_button()
-        self._refresh_action.setEnabled(False)
+        self._update_busy_state()
         self._status.showMessage(f"Deleting 0/{self._delete_total}")
         epoch = self._epoch
         worker = DeletionWorker(selected, self._libraries, mode, epoch)
@@ -1271,10 +1270,7 @@ class MainWindow(QMainWindow):
         self._workers.discard(worker)
         if epoch != self._epoch:
             self._deleting = False
-            if not self._any_deleting():
-                self._refresh_action.setEnabled(True)
-            self._update_delete_button()
-            self._update_delete_tools_button()
+            self._update_busy_state()
             if self._status.currentMessage().startswith("Deleting"):
                 self._status.clearMessage()
             return
@@ -1284,10 +1280,7 @@ class MainWindow(QMainWindow):
                 invalidate(self._config.size_cache, result.prefix)
         save_config(self._config)
         self._deleting = False
-        if not self._any_deleting():
-            self._refresh_action.setEnabled(True)
-        self._update_delete_button()
-        self._update_delete_tools_button()
+        self._update_busy_state()
         self._status.clearMessage()
         if any(r.status is not DeletionStatus.DELETED for r in results):
             show_deletion_summary(self, results)
@@ -1398,9 +1391,7 @@ class MainWindow(QMainWindow):
                     path=link,
                 )
             )
-        shader_caches, shader_warnings = enumerate_shader_caches(self._libraries, self._roots)
-        self._enumeration_warnings.extend(shader_warnings)
-        self._shaders_page.set_data(shader_caches, self._libraries)
+        self._start_shader_enumeration(epoch)
         self._discovery_errors = list(result.errors)
         for warning in self._enumeration_warnings:
             _logger.warning("enumeration warning: %s (%s)", warning.message, warning.path)
@@ -1481,6 +1472,37 @@ class MainWindow(QMainWindow):
             lambda ep, w=scan_worker: self._on_scan_finished(ep, w)
         )
         QThreadPool.globalInstance().start(scan_worker)
+
+    def _start_shader_enumeration(self, epoch: int) -> None:
+        """List shader caches off-thread; the tab stays empty until they arrive.
+
+        Clearing first keeps the previous run's rows from passing as current
+        while the worker reads manifests and shortcuts.
+        """
+        self._shaders_page.set_data([], self._libraries)
+        worker = ShaderEnumerationWorker(self._libraries, self._roots, epoch)
+        self._workers.add(worker)
+        worker.signals.finished.connect(
+            lambda payload, ep, w=worker: self._on_shader_enumeration_finished(payload, ep, w)
+        )
+        try:
+            QThreadPool.globalInstance().start(worker)
+        except RuntimeError:
+            self._workers.discard(worker)
+            _logger.error("could not start shader cache enumeration")
+
+    def _on_shader_enumeration_finished(
+        self, payload: object, epoch: int, worker: QRunnable | None = None
+    ) -> None:
+        self._workers.discard(worker)
+        if epoch != self._epoch or not isinstance(payload, tuple) or len(payload) != 2:
+            return
+        caches, warnings = payload
+        for warning in warnings:
+            _logger.warning("enumeration warning: %s (%s)", warning.message, warning.path)
+        self._enumeration_warnings.extend(warnings)
+        self._update_warning_indicator()
+        self._shaders_page.set_data(caches, self._libraries)
 
     def _on_scan_event(self, event: ScanEvent, epoch: int) -> None:
         if epoch != self._epoch or not isinstance(event, ScanEvent):

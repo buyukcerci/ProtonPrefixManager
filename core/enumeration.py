@@ -186,13 +186,28 @@ class AppIdentity:
     runtime_component: bool
 
 
-def identify_app(app_id: int, library: Library, shortcuts: Mapping[int, str]) -> AppIdentity:
+def identify_app(
+    app_id: int,
+    library: Library,
+    shortcuts: Mapping[int, str],
+    *,
+    other_libraries: Sequence[Library] = (),
+    manifest_cache: dict[tuple[Path, int], str | None] | None = None,
+) -> AppIdentity:
     """Resolve an AppID's name and type: manifest > shortcut > unknown.
 
     Shared by prefix and shader cache enumeration so both classify the
-    same AppID the same way.
+    same AppID the same way. Prefixes only consult their own library, since
+    Steam creates compatdata next to the install. Shader caches can live in
+    a different library than the game, so callers pass other_libraries to
+    search after the own library, in order. manifest_cache lets one
+    enumeration pass avoid re-reading the same manifest per library.
     """
-    manifest_name = _manifest_name(library.path, app_id)
+    manifest_name: str | None = None
+    for candidate in (library, *other_libraries):
+        manifest_name = _cached_manifest_name(candidate.path, app_id, manifest_cache)
+        if manifest_name is not None:
+            break
     shortcut_name = shortcuts.get(app_id)
     resolved_name = manifest_name if manifest_name is not None else shortcut_name
     runtime_component = is_runtime_component(app_id, resolved_name)
@@ -227,6 +242,17 @@ def _classify(
         scan_status=ScanStatus.NOT_SCANNED,
         is_runtime_component=identity.runtime_component,
     )
+
+
+def _cached_manifest_name(
+    library_path: Path, app_id: int, cache: dict[tuple[Path, int], str | None] | None
+) -> str | None:
+    if cache is None:
+        return _manifest_name(library_path, app_id)
+    key = (library_path, app_id)
+    if key not in cache:
+        cache[key] = _manifest_name(library_path, app_id)
+    return cache[key]
 
 
 def _manifest_name(library_path: Path, app_id: int) -> str | None:

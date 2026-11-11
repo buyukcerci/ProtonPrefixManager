@@ -105,6 +105,36 @@ def test_dedupes_on_resolved_path(tmp_path: Path) -> None:
     assert len(caches) == 1
 
 
+def test_manifest_in_other_library_classifies_as_steam(tmp_path: Path) -> None:
+    lib_a = _library(tmp_path, "a", app_ids=(730,))
+    lib_b = _library(tmp_path, "b")
+    _make_manifest(lib_b.path, 730, "Counter-Strike 2")
+    caches, _ = enumerate_shader_caches([lib_a, lib_b], shortcuts_map={})
+    assert len(caches) == 1
+    assert caches[0].cache_type is PrefixType.STEAM
+    assert caches[0].name == "Counter-Strike 2"
+    assert caches[0].library == str(lib_a.path)
+
+
+def test_own_library_manifest_wins_over_other_library(tmp_path: Path) -> None:
+    lib_a = _library(tmp_path, "a")
+    lib_b = _library(tmp_path, "b", app_ids=(730,))
+    _make_manifest(lib_a.path, 730, "Name From A")
+    _make_manifest(lib_b.path, 730, "Name From B")
+    caches, _ = enumerate_shader_caches([lib_a, lib_b], shortcuts_map={})
+    assert [cache.name for cache in caches] == ["Name From B"]
+
+
+def test_orphaned_when_no_library_has_manifest(tmp_path: Path) -> None:
+    lib_a = _library(tmp_path, "a", app_ids=(999,))
+    lib_b = _library(tmp_path, "b")
+    _make_manifest(lib_b.path, 730, "Counter-Strike 2")
+    caches, _ = enumerate_shader_caches([lib_a, lib_b], shortcuts_map={123: "Shortcut"})
+    assert len(caches) == 1
+    assert caches[0].cache_type is PrefixType.ORPHANED
+    assert caches[0].name == "Unknown (AppID: 999)"
+
+
 # --- deletion --------------------------------------------------------------
 
 

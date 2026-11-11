@@ -257,37 +257,15 @@ def _delete_one(
             status=DeletionStatus.REJECTED,
             reject_reason=final,
         )
-    try:
-        if mode is DeleteMode.TRASH:
-            send2trash(target)
-        else:
-            _remove_tree(target)
-    except PermissionError as exc:
-        return DeletionResult(
-            prefix=prefix,
-            mode=mode,
-            status=DeletionStatus.FAILED,
-            failure_kind=FailureKind.PERMISSION,
-            error=str(exc),
-        )
-    except FileNotFoundError:
-        return DeletionResult(
-            prefix=prefix,
-            mode=mode,
-            status=DeletionStatus.REJECTED,
-            reject_reason=RejectReason.MISSING,
-        )
-    except OSError as exc:
-        detail = f"[errno {exc.errno}] {exc.strerror}" if exc.errno else str(exc)
-        kind = FailureKind.TRASH if mode is DeleteMode.TRASH else FailureKind.OS
-        return DeletionResult(
-            prefix=prefix,
-            mode=mode,
-            status=DeletionStatus.FAILED,
-            failure_kind=kind,
-            error=detail,
-        )
-    return DeletionResult(prefix=prefix, mode=mode, status=DeletionStatus.DELETED)
+    outcome = _remove_target(target, mode)
+    return DeletionResult(
+        prefix=prefix,
+        mode=mode,
+        status=outcome.status,
+        reject_reason=outcome.reject_reason,
+        failure_kind=outcome.failure_kind,
+        error=outcome.error,
+    )
 
 
 def _validate(
@@ -335,6 +313,42 @@ def _validate(
 
 def _remove_tree(path: Path) -> None:
     shutil.rmtree(path)
+
+
+@dataclass(slots=True, frozen=True)
+class _RemovalOutcome:
+    """Result of the destructive call alone, shared by every record type."""
+
+    status: DeletionStatus
+    reject_reason: RejectReason | None = None
+    failure_kind: FailureKind | None = None
+    error: str | None = None
+
+
+def _remove_target(target: Path, mode: DeleteMode) -> _RemovalOutcome:
+    """Trash or remove an already validated target and classify the outcome.
+
+    One place for the error mapping so prefixes, tools, and shader caches
+    report identical statuses. send2trash and _remove_tree are looked up as
+    module globals at call time so tests can monkeypatch them.
+    """
+    try:
+        if mode is DeleteMode.TRASH:
+            send2trash(target)
+        else:
+            _remove_tree(target)
+    except PermissionError as exc:
+        return _RemovalOutcome(
+            DeletionStatus.FAILED, failure_kind=FailureKind.PERMISSION, error=str(exc)
+        )
+    except FileNotFoundError:
+        # The directory vanished after the final check; nothing was deleted.
+        return _RemovalOutcome(DeletionStatus.REJECTED, reject_reason=RejectReason.MISSING)
+    except OSError as exc:
+        detail = f"[errno {exc.errno}] {exc.strerror}" if exc.errno else str(exc)
+        kind = FailureKind.TRASH if mode is DeleteMode.TRASH else FailureKind.OS
+        return _RemovalOutcome(DeletionStatus.FAILED, failure_kind=kind, error=detail)
+    return _RemovalOutcome(DeletionStatus.DELETED)
 
 
 @dataclass(slots=True)
@@ -556,37 +570,15 @@ def _delete_one_tool(
             status=DeletionStatus.REJECTED,
             reject_reason=final,
         )
-    try:
-        if mode is DeleteMode.TRASH:
-            send2trash(target)
-        else:
-            _remove_tree(target)
-    except PermissionError as exc:
-        return ToolDeletionResult(
-            tool=tool,
-            mode=mode,
-            status=DeletionStatus.FAILED,
-            failure_kind=FailureKind.PERMISSION,
-            error=str(exc),
-        )
-    except FileNotFoundError:
-        return ToolDeletionResult(
-            tool=tool,
-            mode=mode,
-            status=DeletionStatus.REJECTED,
-            reject_reason=RejectReason.MISSING,
-        )
-    except OSError as exc:
-        detail = f"[errno {exc.errno}] {exc.strerror}" if exc.errno else str(exc)
-        kind = FailureKind.TRASH if mode is DeleteMode.TRASH else FailureKind.OS
-        return ToolDeletionResult(
-            tool=tool,
-            mode=mode,
-            status=DeletionStatus.FAILED,
-            failure_kind=kind,
-            error=detail,
-        )
-    return ToolDeletionResult(tool=tool, mode=mode, status=DeletionStatus.DELETED)
+    outcome = _remove_target(target, mode)
+    return ToolDeletionResult(
+        tool=tool,
+        mode=mode,
+        status=outcome.status,
+        reject_reason=outcome.reject_reason,
+        failure_kind=outcome.failure_kind,
+        error=outcome.error,
+    )
 
 
 def _validate_tool(
@@ -763,25 +755,12 @@ def _delete_one_shader_cache(
     final = _final_check(target)
     if final is not None:
         return reject(final)
-    try:
-        if mode is DeleteMode.TRASH:
-            send2trash(target)
-        else:
-            _remove_tree(target)
-    except PermissionError as exc:
-        return ShaderDeletionResult(
-            cache=cache,
-            mode=mode,
-            status=DeletionStatus.FAILED,
-            failure_kind=FailureKind.PERMISSION,
-            error=str(exc),
-        )
-    except FileNotFoundError:
-        return reject(RejectReason.MISSING)
-    except OSError as exc:
-        detail = f"[errno {exc.errno}] {exc.strerror}" if exc.errno else str(exc)
-        kind = FailureKind.TRASH if mode is DeleteMode.TRASH else FailureKind.OS
-        return ShaderDeletionResult(
-            cache=cache, mode=mode, status=DeletionStatus.FAILED, failure_kind=kind, error=detail
-        )
-    return ShaderDeletionResult(cache=cache, mode=mode, status=DeletionStatus.DELETED)
+    outcome = _remove_target(target, mode)
+    return ShaderDeletionResult(
+        cache=cache,
+        mode=mode,
+        status=outcome.status,
+        reject_reason=outcome.reject_reason,
+        failure_kind=outcome.failure_kind,
+        error=outcome.error,
+    )

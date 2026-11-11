@@ -15,7 +15,11 @@ EnumerationWarning. Each library's ``shadercache`` is listed through a
 pinned directory descriptor, and every row records the device and inode of
 its entry so deletion can verify it still targets the enumerated
 directory. Names and classification come from the same manifest > shortcut
-> unknown chain prefixes use, so one AppID reads the same on both tabs.
+> unknown chain prefixes use, so one AppID reads the same on both tabs, with
+one difference: the manifest is looked up across all libraries (the cache's
+own library first, then the others in order). Steam can keep a game's
+shader cache in a different library than its install, and such a cache must
+not be mislabelled as orphaned.
 """
 
 from __future__ import annotations
@@ -80,17 +84,31 @@ def enumerate_shader_caches(
     warnings: list[EnumerationWarning] = []
     seen: set[str] = set()
     seen_warnings: set[str] = set()
+    manifest_cache: dict[tuple[Path, int], str | None] = {}
     for library in libraries:
         steamapps = library.path / STEAMAPPS_DIR
         if not is_real_dir(steamapps):
             continue
         shadercache = steamapps / SHADERCACHE_DIR
+        others = [other for other in libraries if other.path != library.path]
 
-        def build(name: str, *, library: Library = library, base: Path = shadercache):
+        def build(
+            name: str,
+            *,
+            library: Library = library,
+            base: Path = shadercache,
+            others: Sequence[Library] = others,
+        ):
             app_id = parse_ascii_decimal(name)
             if app_id is None or app_id in IGNORED_APP_IDS:
                 return None
-            identity = identify_app(app_id, library, shortcuts)
+            identity = identify_app(
+                app_id,
+                library,
+                shortcuts,
+                other_libraries=others,
+                manifest_cache=manifest_cache,
+            )
             return ShaderCache(
                 app_id=app_id,
                 name=identity.name,

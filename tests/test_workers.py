@@ -18,6 +18,9 @@ from ui.workers import (
     DiscoveryWorker,
     OpenFolderWorker,
     ScanWorker,
+    ShaderDeletionWorker,
+    ShaderEnumerationWorker,
+    SizeWorker,
     ToolDeletionWorker,
     ToolSizeWorker,
 )
@@ -669,3 +672,85 @@ def test_open_folder_worker_finished_barrier_on_exception(
     assert result.path == target  # type: ignore[attr-defined]
     assert result.status is OpenStatus.LAUNCH_FAILED  # type: ignore[attr-defined]
     assert "simulated open folder crash" in (result.error or "")  # type: ignore[attr-defined]
+
+
+def test_tool_size_worker_is_the_shared_size_worker() -> None:
+    assert ToolSizeWorker is SizeWorker
+
+
+def _shader_cache(tmp_path: Path, app_id: int):
+    from core.shaders import ShaderCache
+
+    path = tmp_path / "lib" / "steamapps" / "shadercache" / str(app_id)
+    path.mkdir(parents=True)
+    return ShaderCache(app_id, f"G{app_id}", PrefixType.ORPHANED, path, str(tmp_path / "lib"))
+
+
+def test_shader_deletion_worker_remaining_failed_on_exception(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from core.deletion import DeletionStatus, FailureKind, ShaderDeletionResult
+    from ui import workers as workers_module
+
+    first = _shader_cache(tmp_path, 1)
+    second = _shader_cache(tmp_path, 2)
+
+    def partially_failing_delete(*args: object, **kwargs: object):
+        yield ShaderDeletionResult(
+            cache=first, mode=DeleteMode.TRASH, status=DeletionStatus.DELETED
+        )
+        raise RuntimeError("crash after first cache")
+
+    # Patched after the worker module was imported: the worker must look the
+    # iterator up at run time to pick this one up.
+    monkeypatch.setattr(workers_module, "iter_delete_shader_caches", partially_failing_delete)
+    worker = ShaderDeletionWorker([first, second], [], DeleteMode.TRASH, epoch=21)
+    events: list[object] = []
+    finished: list[int] = []
+    worker.signals.result_ready.connect(lambda r, _e: events.append(r))
+    worker.signals.finished.connect(finished.append)
+    worker.run()
+
+    assert finished == [21]
+    assert [r.cache.app_id for r in events] == [1, 2]
+    assert events[0].status is DeletionStatus.DELETED
+    assert events[1].status is DeletionStatus.FAILED
+    assert events[1].failure_kind is FailureKind.OS
+    assert "crash after first cache" in (events[1].error or "")
+
+
+def test_shader_enumeration_worker_reports_caches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from ui import workers as workers_module
+
+    cache = _shader_cache(tmp_path, 7)
+    calls: list[tuple[object, object]] = []
+
+    def fake_enumerate(libraries, roots=None, **kwargs):
+        calls.append((libraries, roots))
+        return [cache], ["warning"]
+
+    monkeypatch.setattr(workers_module, "enumerate_shader_caches", fake_enumerate)
+    worker = ShaderEnumerationWorker(["lib"], ["root"], epoch=22)
+    emitted: list[tuple[object, int]] = []
+    worker.signals.finished.connect(lambda payload, epoch: emitted.append((payload, epoch)))
+    worker.run()
+    assert calls == [(["lib"], ["root"])]
+    assert emitted == [(([cache], ["warning"]), 22)]
+
+
+def test_shader_enumeration_worker_finished_barrier_on_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ui import workers as workers_module
+
+    def failing_enumerate(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("simulated enumeration crash")
+
+    monkeypatch.setattr(workers_module, "enumerate_shader_caches", failing_enumerate)
+    worker = ShaderEnumerationWorker([], [], epoch=23)
+    emitted: list[tuple[object, int]] = []
+    worker.signals.finished.connect(lambda payload, epoch: emitted.append((payload, epoch)))
+    worker.run()
+    assert emitted == [(([], []), 23)]

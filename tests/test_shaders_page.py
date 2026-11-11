@@ -166,6 +166,108 @@ def test_checkbox_and_header_toggle(qtbot, tmp_path: Path) -> None:
     assert page.model.selected_caches() == []
 
 
+def test_header_checkbox_resyncs_without_rows(qtbot) -> None:
+    page = _page(qtbot)
+    page.set_data([], [])
+    page.header_checkbox.click()
+    assert page.header_checkbox.checkState() == Qt.CheckState.Unchecked
+    page.header_checkbox.click()
+    assert page.header_checkbox.checkState() == Qt.CheckState.Unchecked
+
+
+def test_header_checkbox_click_from_partial_selects_all(qtbot, tmp_path: Path) -> None:
+    lib = _library(tmp_path)
+    page = _page(qtbot)
+    page.set_data(
+        [_cache(lib, 1, PrefixType.STEAM, "A"), _cache(lib, 2, PrefixType.STEAM, "B")], [lib]
+    )
+    page.model.setData(
+        page.model.index(0, CHECK_COLUMN),
+        int(Qt.CheckState.Checked.value),
+        Qt.ItemDataRole.CheckStateRole,
+    )
+    assert page.header_checkbox.checkState() == Qt.CheckState.PartiallyChecked
+    page.header_checkbox.click()
+    assert len(page.model.selected_caches()) == 2
+    assert page.header_checkbox.checkState() == Qt.CheckState.Checked
+    page.header_checkbox.click()
+    assert page.model.selected_caches() == []
+    assert page.header_checkbox.checkState() == Qt.CheckState.Unchecked
+
+
+def test_size_results_coalesce_into_one_refresh(qtbot, tmp_path: Path) -> None:
+    lib = _library(tmp_path)
+    caches = [_cache(lib, app_id, PrefixType.STEAM, f"G{app_id}") for app_id in (1, 2, 3, 4)]
+    page = _page(qtbot)
+    page._all = list(caches)
+    page.model.reset_items(caches)
+    page._apply_filter()
+    emitted: list[bool] = []
+    page.data_changed.connect(lambda: emitted.append(True))
+    for size, cache in zip((10, 40, 30), caches[:3], strict=True):
+        page._on_sized((str(cache.path), size, None), 0)
+    # The size cells update at once, but nothing is re-sorted or announced yet.
+    assert emitted == []
+    assert _visible_ids(page) == [1, 2, 3, 4]
+    assert page._size_refresh_timer.isActive()
+    qtbot.waitUntil(lambda: bool(emitted), timeout=2000)
+    assert emitted == [True]
+    assert _visible_ids(page) == [2, 3, 1, 4]
+    # The last outstanding result flushes immediately instead of waiting.
+    page._on_sized((str(caches[3].path), 50, None), 0)
+    assert emitted == [True, True]
+    assert _visible_ids(page) == [4, 2, 3, 1]
+    assert not page._size_refresh_timer.isActive()
+
+
+def test_size_finished_flushes_pending_refresh(qtbot, tmp_path: Path) -> None:
+    lib = _library(tmp_path)
+    caches = [_cache(lib, app_id, PrefixType.STEAM, f"G{app_id}") for app_id in (1, 2)]
+    page = _page(qtbot)
+    page._all = list(caches)
+    page.model.reset_items(caches)
+    page._apply_filter()
+    emitted: list[bool] = []
+    page.data_changed.connect(lambda: emitted.append(True))
+    page._on_sized((str(caches[1].path), 99, None), 0)
+    assert emitted == []
+    page._on_size_finished(0)
+    assert emitted == [True]
+    assert not page._size_refresh_timer.isActive()
+    assert _visible_ids(page) == [2, 1]
+    assert page.model.index(1, SIZE_COLUMN).data() == "Unavailable"
+
+
+def test_delete_start_failure_releases_busy_state(
+    qtbot, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lib = _library(tmp_path)
+    cache = _cache(lib, 1, PrefixType.STEAM, "A")
+    page = _page(qtbot)
+    page.set_data([cache], [lib])
+    qtbot.waitUntil(lambda: not page.pending, timeout=10000)
+    page.model.set_all_selected(True)
+
+    class _RefusingPool:
+        def start(self, _worker: object) -> None:
+            raise RuntimeError("pool unavailable")
+
+    monkeypatch.setattr(page_module.QThreadPool, "globalInstance", lambda: _RefusingPool())
+    busy: list[bool] = []
+    messages: list[tuple[str, int]] = []
+    page.busy_changed.connect(busy.append)
+    page.status_message.connect(lambda text, ms: messages.append((text, ms)))
+    page._start_deletion([cache], DeleteMode.TRASH)
+    assert busy == [True, False]
+    assert not page.is_deleting
+    assert page.delete_button.isEnabled()
+    assert not page._workers
+    assert messages[-1] == (
+        page_module.DELETE_START_FAILED_TEXT,
+        page_module.DELETE_START_FAILED_TIMEOUT_MS,
+    )
+
+
 def test_delete_button_respects_external_busy(qtbot, tmp_path: Path) -> None:
     lib = _library(tmp_path)
     page = _page(qtbot, busy=True)
@@ -246,7 +348,22 @@ def test_window_discovery_fills_shaders_tab(qtbot, tmp_path: Path) -> None:
     (shadercache / "730").mkdir(parents=True)
     window._on_discovery_finished((result, prefixes), window._epoch)
     assert window._tabs.tabText(_PAGE_SHADERS) == "Shaders"
+    # Enumeration runs off the GUI thread; the tab fills when it reports.
+    qtbot.waitUntil(lambda: bool(window._shaders_page.caches()), timeout=10000)
     assert [c.app_id for c in window._shaders_page.caches()] == [730]
+
+
+def test_window_drops_stale_shader_enumeration(qtbot, tmp_path: Path) -> None:
+    from ui.main_window import MainWindow
+
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    lib = _library(tmp_path)
+    cache = _cache(lib, 1, PrefixType.STEAM, "A")
+    window._on_shader_enumeration_finished(([cache], []), window._epoch + 1)
+    assert window._shaders_page.caches() == []
+    window._on_shader_enumeration_finished(([cache], []), window._epoch)
+    assert [c.app_id for c in window._shaders_page.caches()] == [1]
 
 
 def test_window_warns_about_symlinked_shadercache(qtbot, tmp_path: Path) -> None:
@@ -261,7 +378,9 @@ def test_window_warns_about_symlinked_shadercache(qtbot, tmp_path: Path) -> None
     link = result.libraries[0].path / "steamapps" / "shadercache"
     link.symlink_to(outside, target_is_directory=True)
     window._on_discovery_finished((result, prefixes), window._epoch)
-    assert any(w.path == link for w in window._enumeration_warnings)
+    qtbot.waitUntil(
+        lambda: any(w.path == link for w in window._enumeration_warnings), timeout=10000
+    )
     assert window._shaders_page.caches() == []
 
 
@@ -292,9 +411,13 @@ def test_window_prefix_delete_locks_shader_delete(qtbot, tmp_path: Path) -> None
     window._shaders_page.model.set_all_selected(True)
     assert window._shaders_page.delete_button.isEnabled()
     window._deleting = True
-    window._update_delete_tools_button()
+    window._update_busy_state()
     assert not window._shaders_page.delete_button.isEnabled()
+    assert not window._refresh_action.isEnabled()
     window._deleting = False
+    window._update_busy_state()
+    assert window._shaders_page.delete_button.isEnabled()
+    assert window._refresh_action.isEnabled()
 
 
 # --- overview section and prefix hint --------------------------------------

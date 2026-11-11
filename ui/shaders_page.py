@@ -57,6 +57,7 @@ from ui.styles import (
     MESSAGE_LAYOUT_SPACING_PX,
     MESSAGE_PAGE_MARGIN_PX,
     SEARCH_DEBOUNCE_MS,
+    SHADERS_SIZE_DEBOUNCE_MS,
     set_message_content,
 )
 from ui.table import shared_view_settings
@@ -98,6 +99,8 @@ RECOMPILE_NOTE = (
     "Steam rebuilds a shader cache when its game next runs, "
     "so that first launch may stutter while shaders compile."
 )
+DELETE_START_FAILED_TEXT = "Could not start shader cache deletion."
+DELETE_START_FAILED_TIMEOUT_MS = 5000
 
 _ROOT_INDEX = QModelIndex()
 
@@ -344,6 +347,13 @@ class ShadersPage(QWidget):
         self._delete_total = 0
         self._delete_results: list[ShaderDeletionResult] = []
         self.model = ShaderTableModel()
+        # Size results arrive one per cache; re-sorting the table and
+        # rebuilding the overview for each would be quadratic GUI work and
+        # reshuffle rows under the cursor, so both are coalesced.
+        self._size_refresh_timer = QTimer(self)
+        self._size_refresh_timer.setSingleShot(True)
+        self._size_refresh_timer.setInterval(SHADERS_SIZE_DEBOUNCE_MS)
+        self._size_refresh_timer.timeout.connect(self._flush_size_refresh)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -445,6 +455,7 @@ class ShadersPage(QWidget):
         """Take one discovery run's rows and start measuring their sizes."""
         self._all = list(caches)
         self._libraries = list(libraries)
+        self._size_refresh_timer.stop()
         self.model.reset_items(self._all)
         self._apply_filter()
         self.data_changed.emit()
@@ -489,17 +500,29 @@ class ShadersPage(QWidget):
             replace(cache, size_bytes=size) if shader_cache_key(cache) == key else cache
             for cache in self._all
         ]
+        # The size cell updates now; the re-sort, summary and overview wait
+        # for the debounce, except after the last result so the final order
+        # is settled as soon as every cache is measured.
         self.model.set_size(key, size, failed=error is not None)
-        if self._sort_key == "size":
-            self._apply_filter()
-        self._update_summary()
-        self.data_changed.emit()
+        if self.model.pending:
+            self._size_refresh_timer.start()
+        else:
+            self._flush_size_refresh()
 
     def _on_size_finished(self, epoch: int, worker: QRunnable | None = None) -> None:
         self._workers.discard(worker)
         if epoch != self._epoch_provider():
             return
         self.model.mark_pending_unavailable()
+        self._flush_size_refresh()
+
+    def _flush_size_refresh(self) -> None:
+        """Apply the size-driven re-sort, summary and data_changed once."""
+        self._size_refresh_timer.stop()
+        if self._sort_key == "size":
+            self._apply_filter()
+        else:
+            self._update_summary()
         self.data_changed.emit()
 
     # --- filtering and sorting ----------------------------------------------
@@ -628,9 +651,12 @@ class ShadersPage(QWidget):
         self.header_checkbox.setGeometry(x, y, hint.width(), hint.height())
 
     def _on_header_toggle(self) -> None:
+        # Qt has already cycled the tristate box by the time clicked fires,
+        # so its state is resynced from the model even when nothing changed.
         rows = self.model.rows()
         if rows:
             self.model.set_all_selected(not all(self.model.is_selected(c) for c in rows))
+        self._update_header_checkbox()
 
     def _update_summary(self) -> None:
         total = sum(cache.size_bytes for cache in self._all)
@@ -686,7 +712,16 @@ class ShadersPage(QWidget):
         self._workers.add(worker)
         worker.signals.result_ready.connect(self._on_deletion_result)
         worker.signals.finished.connect(lambda ep, w=worker: self._on_deletion_finished(ep, w))
-        QThreadPool.globalInstance().start(worker)
+        try:
+            QThreadPool.globalInstance().start(worker)
+        except RuntimeError:
+            # finished would never fire, leaving every delete button and
+            # Refresh locked; undo the busy state instead.
+            self._workers.discard(worker)
+            self._deleting = False
+            self.update_delete_button()
+            self.busy_changed.emit(False)
+            self.status_message.emit(DELETE_START_FAILED_TEXT, DELETE_START_FAILED_TIMEOUT_MS)
 
     def _on_deletion_result(self, result: object, epoch: int) -> None:
         if epoch != self._epoch_provider() or not isinstance(result, ShaderDeletionResult):
@@ -711,4 +746,5 @@ class ShadersPage(QWidget):
     def stop(self) -> None:
         """Window is closing: drop timers so nothing fires after teardown."""
         self._search_timer.stop()
+        self._size_refresh_timer.stop()
         self.model.clear_highlight()
