@@ -69,7 +69,7 @@ from core.scanner import (
     record_scan,
     refresh_needed,
 )
-from core.shaders import enumerate_shader_caches
+from core.shaders import ShaderCache, enumerate_shader_caches
 from core.toolmap import ToolMapError, contributing_roots, load_tool_mapping, tool_name_for
 from core.tools import (
     SYSTEM_TOOLS_DIR,
@@ -693,6 +693,13 @@ class MainWindow(QMainWindow):
         self._overview.prefix_focus_requested.connect(self._on_prefix_focus_requested)
         self._overview.tool_review_requested.connect(self._on_tool_review_requested)
         self._overview.tool_focus_requested.connect(self._on_tool_focus_requested)
+        self._overview.shader_review_requested.connect(self._on_shader_review_requested)
+        self._overview.shader_focus_requested.connect(self._on_shader_focus_requested)
+        self._shaders_page.data_changed.connect(self._refresh_shaders_overview)
+        self._shader_sizes: dict[int, int] = {}
+        self._model.set_shader_size_provider(
+            lambda prefix: self._shader_sizes.get(prefix.app_id, 0)
+        )
 
         self._tabs = QTabWidget()
         self._tabs.addTab(self._overview, "Overview")
@@ -1550,6 +1557,30 @@ class MainWindow(QMainWindow):
             self._tools_model.failed,
             self._tools_model.usage_known,
         )
+        self._refresh_shaders_overview()
+
+    def _refresh_shaders_overview(self) -> None:
+        """Push the Shaders tab's rows and size states into the overview.
+
+        Also refreshes the per-AppID totals behind the prefix size tooltip;
+        a game can have caches in several libraries, so they are summed.
+        """
+        page = self._shaders_page
+        sizes: dict[int, int] = {}
+        for cache in page.caches():
+            sizes[cache.app_id] = sizes.get(cache.app_id, 0) + cache.size_bytes
+        self._shader_sizes = sizes
+        self._overview.update_shaders(page.caches(), page.pending, page.failed, self._disk_capacity)
+
+    def _on_shader_review_requested(self) -> None:
+        self._shaders_page.show_orphans()
+        self._set_page(_PAGE_SHADERS)
+
+    def _on_shader_focus_requested(self, cache: object) -> None:
+        if not isinstance(cache, ShaderCache):
+            return
+        self._set_page(_PAGE_SHADERS)
+        self._shaders_page.focus_cache(cache)
 
     def _refresh_tools_overview(self) -> None:
         """Refresh only the tools section after one async size result."""

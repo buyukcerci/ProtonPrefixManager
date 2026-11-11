@@ -728,10 +728,11 @@ def test_overview_section_order(qtbot) -> None:
     assert layout is not None
 
     treemap_idx = -1
-    separator_idx = -1
+    separators: list[int] = []
     prefix_list_idx = -1
     tools_treemap_idx = -1
     tools_list_idx = -1
+    shaders_list_idx = -1
 
     for i in range(layout.count()):
         item = layout.itemAt(i)
@@ -745,16 +746,21 @@ def test_overview_section_order(qtbot) -> None:
             and widget.objectName() == ""
             and widget.__class__.__name__ == "QFrame"
         ):
-            separator_idx = i
+            separators.append(i)
         elif widget is page.top_list:
             prefix_list_idx = i
         elif widget is page.tools_treemap:
             tools_treemap_idx = i
         elif widget is page.tools_top_list:
             tools_list_idx = i
+        elif widget is page.shaders_top_list:
+            shaders_list_idx = i
 
-    assert 0 <= treemap_idx < separator_idx
-    assert prefix_list_idx < separator_idx < tools_treemap_idx < tools_list_idx
+    assert len(separators) == 2
+    tools_separator, shaders_separator = separators
+    assert 0 <= treemap_idx < tools_separator
+    assert prefix_list_idx < tools_separator < tools_treemap_idx < tools_list_idx
+    assert tools_list_idx < shaders_separator < shaders_list_idx
 
 
 def test_top_lists_fixed_widths(qtbot) -> None:

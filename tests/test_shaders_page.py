@@ -295,3 +295,93 @@ def test_window_prefix_delete_locks_shader_delete(qtbot, tmp_path: Path) -> None
     window._update_delete_tools_button()
     assert not window._shaders_page.delete_button.isEnabled()
     window._deleting = False
+
+
+# --- overview section and prefix hint --------------------------------------
+
+
+def test_overview_shader_section_totals_and_orphan_card(qtbot, tmp_path: Path) -> None:
+    from ui.overview import OverviewPage
+
+    lib = _library(tmp_path)
+    installed = replace_size(_cache(lib, 1, PrefixType.STEAM, "Alpha"), 3000)
+    orphan = replace_size(_cache(lib, 2, PrefixType.ORPHANED, "Beta"), 1000)
+    page = OverviewPage()
+    qtbot.addWidget(page)
+    assert not page.shader_orphan_card.is_clickable_enabled()
+    page.update_shaders([installed, orphan], set(), set(), 1_000_000)
+    assert page.shaders_card.value_text() == "2"
+    assert page.shader_orphan_card.detail_text() == "1 orphaned cache"
+    assert page.shader_orphan_card.is_clickable_enabled()
+    assert [row._item for row in page.shaders_top_list.rows()] == [installed, orphan]
+    assert page.shaders_status_label.text() == "2 of 2 shader caches sized"
+    page.update_shaders([installed], {str(installed.path)}, set(), None)
+    assert page.shaders_status_label.text() == "0 of 1 shader caches sized, 1 scanning"
+    assert page.shaders_disk_card.detail_text() == "disk size unknown"
+    reviews: list[bool] = []
+    page.shader_review_requested.connect(lambda: reviews.append(True))
+    page._on_shader_orphan_card_clicked()
+    assert reviews == []  # no orphans in the latest update
+
+
+def replace_size(cache: ShaderCache, size: int) -> ShaderCache:
+    from dataclasses import replace
+
+    return replace(cache, size_bytes=size)
+
+
+def test_window_overview_handoffs(qtbot, tmp_path: Path) -> None:
+    from ui.main_window import _PAGE_SHADERS, MainWindow
+
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    lib = _library(tmp_path)
+    keep = _cache(lib, 1, PrefixType.STEAM, "Alpha")
+    orphan = _cache(lib, 2, PrefixType.ORPHANED, "Beta")
+    window._shaders_page.set_data([keep, orphan], [lib])
+    qtbot.waitUntil(lambda: not window._shaders_page.pending, timeout=10000)
+    assert window._overview.shaders_card.value_text() == "2"
+    window._overview.shader_review_requested.emit()
+    assert window._tabs.currentIndex() == _PAGE_SHADERS
+    assert _visible_ids(window._shaders_page) == [2]
+    window._overview.shader_focus_requested.emit(keep)
+    assert window._shaders_page.model.highlighted_key() == str(keep.path)
+    assert 1 in _visible_ids(window._shaders_page)
+
+
+def test_prefix_size_tooltip_mentions_shader_cache(qtbot, tmp_path: Path) -> None:
+    from core.models import Prefix, ScanStatus, Store
+    from ui.main_window import MainWindow
+    from ui.table import SIZE_COLUMN as PREFIX_SIZE_COLUMN
+
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    lib = _library(tmp_path)
+    window._shaders_page.set_data([_cache(lib, 730, PrefixType.STEAM, "CS2", size=4096)], [lib])
+    qtbot.waitUntil(lambda: not window._shaders_page.pending, timeout=10000)
+    compat = tmp_path / "compat"
+    store = Store()
+    for app_id in (730, 440):
+        (compat / str(app_id)).mkdir(parents=True)
+        store.merge(
+            [
+                Prefix(
+                    app_id,
+                    f"Game {app_id}",
+                    PrefixType.STEAM,
+                    compat / str(app_id),
+                    str(lib.path),
+                    size_bytes=10,
+                    scan_status=ScanStatus.SCANNED,
+                )
+            ]
+        )
+    window._model.set_store(store)
+    tooltips = {
+        window._model.row_at(row).app_id: window._model.index(row, PREFIX_SIZE_COLUMN).data(
+            Qt.ItemDataRole.ToolTipRole
+        )
+        for row in range(window._model.rowCount())
+    }
+    assert tooltips[730] is not None and "shader cache" in tooltips[730]
+    assert tooltips[440] is None

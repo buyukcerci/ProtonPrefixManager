@@ -108,6 +108,7 @@ class PrefixTableModel(QAbstractTableModel):
         self._openable: list[bool] = []
         self._error_provider = error_provider
         self._tool_provider = tool_provider
+        self._shader_size_provider: Callable[[Prefix], int] | None = None
         self._highlighted_key: tuple[int, str] | None = None
         self._highlight_timer = QTimer(self)
         self._highlight_timer.setSingleShot(True)
@@ -144,6 +145,14 @@ class PrefixTableModel(QAbstractTableModel):
                 self.index(0, NAME_COLUMN),
                 self.index(len(self._rows) - 1, NAME_COLUMN),
             )
+
+    def set_shader_size_provider(self, provider: Callable[[Prefix], int] | None) -> None:
+        """Lookup for the size of the shader cache sharing a prefix's AppID.
+
+        Only feeds the size tooltip, which Qt asks for on hover, so no
+        repaint is needed when the sizes behind it change.
+        """
+        self._shader_size_provider = provider
 
     def rows(self) -> list[Prefix]:
         return list(self._rows)
@@ -328,6 +337,10 @@ class PrefixTableModel(QAbstractTableModel):
                 if error:
                     return sanitize_tooltip(error)
             return _SIZE_FAILED_TOOLTIP
+        if column == SIZE_COLUMN and self._shader_size_provider is not None:
+            shader_bytes = self._shader_size_provider(prefix)
+            if shader_bytes > 0:
+                return f"Plus {format_size(shader_bytes)} of shader cache (see the Shaders tab)"
         return None
 
 

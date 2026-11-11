@@ -2,7 +2,7 @@
 
 The page is a passive view: state flows in through update_data and user
 intent flows out through signals (orphan review, prefix focus, tool
-review, tool focus). All colors are derived from the current palette at
+review, tool focus, shader review, shader focus). All colors are derived from the current palette at
 paint time so theme changes apply on the next repaint without cached state.
 """
 
@@ -34,6 +34,7 @@ from core.analytics import (
     use_zoom_mode,
 )
 from core.models import Prefix, PrefixType, ScanStatus, format_size
+from core.shaders import ShaderCache
 from core.tools import Tool, ToolCategory, tool_category
 from core.treemap import CellRect, layout_sized
 from ui.sanitize import sanitize_display, sanitize_tooltip
@@ -70,6 +71,8 @@ _ORPHAN_CARD_TOOLTIP = "Click to review orphaned prefixes on the Prefixes page"
 _ORPHAN_CARD_EMPTY_TOOLTIP = "No orphaned prefixes"
 _RECLAIMABLE_CARD_TOOLTIP = "Click to review unused tools on the Tools page"
 _RECLAIMABLE_CARD_EMPTY_TOOLTIP = "No unused tools"
+_SHADER_ORPHAN_CARD_TOOLTIP = "Click to review orphaned shader caches on the Shaders page"
+_SHADER_ORPHAN_CARD_EMPTY_TOOLTIP = "No orphaned shader caches"
 _TOOL_SCANNING_TEXT = "Scanning..."
 _TOOL_UNAVAILABLE_TEXT = "Unavailable"
 
@@ -709,12 +712,15 @@ def tool_used_set(used: set[str] | Mapping[str, list[int]] | None) -> set[str]:
 
 def tool_size_text(tool: Tool, pending: set[str], failed: set[str]) -> str:
     """Size label for one tool, matching the tools table states."""
-    key = str(tool.path)
+    return _path_size_text(str(tool.path), tool.size_bytes, pending, failed)
+
+
+def _path_size_text(key: str, size_bytes: int, pending: set[str], failed: set[str]) -> str:
     if key in pending:
         return _TOOL_SCANNING_TEXT
     if key in failed:
         return _TOOL_UNAVAILABLE_TEXT
-    return format_size(tool.size_bytes)
+    return format_size(size_bytes)
 
 
 def tool_top_largest(tools: Sequence[Tool], limit: int) -> list[Tool]:
@@ -724,16 +730,30 @@ def tool_top_largest(tools: Sequence[Tool], limit: int) -> list[Tool]:
 
 
 def _tool_scan_status_text(tools: Sequence[Tool], pending: set[str], failed: set[str]) -> str:
-    total = len(tools)
+    paths = [str(tool.path) for tool in tools]
+    return _sized_status_text(paths, pending, failed, "tools", "No Proton tools found")
+
+
+def _shader_scan_status_text(
+    caches: Sequence[ShaderCache], pending: set[str], failed: set[str]
+) -> str:
+    paths = [str(cache.path) for cache in caches]
+    return _sized_status_text(paths, pending, failed, "shader caches", "No shader caches found")
+
+
+def _sized_status_text(
+    item_paths: Sequence[str], pending: set[str], failed: set[str], noun: str, empty_text: str
+) -> str:
+    total = len(item_paths)
     if total == 0:
-        return "No Proton tools found"
-    # Count only paths of listed tools, so a stale entry in either set
-    # (a tool since deleted or filtered out) cannot skew the numbers.
-    paths = {str(tool.path) for tool in tools}
+        return empty_text
+    # Count only paths of listed items, so a stale entry in either set
+    # (an item since deleted or filtered out) cannot skew the numbers.
+    paths = set(item_paths)
     pending = pending & paths
     failed = (failed & paths) - pending
     sized = total - len(pending) - len(failed)
-    text = f"{sized} of {total} tools sized"
+    text = f"{sized} of {total} {noun} sized"
     if pending:
         text += f", {len(pending)} scanning"
     if failed:
@@ -741,26 +761,26 @@ def _tool_scan_status_text(tools: Sequence[Tool], pending: set[str], failed: set
     return text
 
 
-class ToolTopRow(QFrame):
-    """One ranked entry in the largest-tools section."""
+class RankedRow(QFrame):
+    """One ranked, clickable entry: rank, category dot, name, size."""
 
     activated = Signal(object)
 
     def __init__(
         self,
         rank: int,
-        tool: Tool,
+        item: object,
+        name: str,
+        category: PrefixType | ToolCategory,
         size_text: str,
-        used_set: set[str] | None = None,
-        usage_known: bool = True,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self._tool = tool
+        self._item = item
         self.setObjectName("topListRow")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setAccessibleName(f"{rank}. {sanitize_display(tool.name)}")
+        self.setAccessibleName(f"{rank}. {sanitize_display(name)}")
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 5, 8, 5)
         layout.setSpacing(OVERVIEW_TOP_ROW_SPACING_PX)
@@ -769,10 +789,9 @@ class ToolTopRow(QFrame):
         self._rank_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self._rank_label)
         self._dot = ClassificationSwatch(circle=True, size_px=OVERVIEW_DOT_SIZE_PX, parent=self)
-        category = tool_category(tool, used_set or set(), usage_known=usage_known)
         self._dot.set_category(category)
         layout.addWidget(self._dot)
-        self._name_label = ElidedLabel(sanitize_display(tool.name), self)
+        self._name_label = ElidedLabel(sanitize_display(name), self)
         self._name_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
         self._name_label.setFixedWidth(OVERVIEW_TOP_NAME_MAX_PX)
         layout.addWidget(self._name_label)
@@ -785,7 +804,7 @@ class ToolTopRow(QFrame):
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt override)
         if event.button() is Qt.MouseButton.LeftButton:
-            self.activated.emit(self._tool)
+            self.activated.emit(self._item)
         super().mousePressEvent(event)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802 (Qt override)
@@ -795,16 +814,33 @@ class ToolTopRow(QFrame):
             int(Qt.Key.Key_Enter),
             int(Qt.Key.Key_Space),
         ):
-            self.activated.emit(self._tool)
+            self.activated.emit(self._item)
             event.accept()
             return
         super().keyPressEvent(event)
 
 
-class ToolTopListWidget(QFrame):
-    """Ranked list of the largest tools with table-matched size states."""
+class ToolTopRow(RankedRow):
+    """One ranked entry in the largest-tools section."""
 
-    tool_focus_requested = Signal(object)
+    def __init__(
+        self,
+        rank: int,
+        tool: Tool,
+        size_text: str,
+        used_set: set[str] | None = None,
+        usage_known: bool = True,
+        parent: QWidget | None = None,
+    ) -> None:
+        category = tool_category(tool, used_set or set(), usage_known=usage_known)
+        super().__init__(rank, tool, tool.name, category, size_text, parent)
+        self._tool = tool
+
+
+class RankedListWidget(QFrame):
+    """Card holding a header row and RankedRow entries; emits the clicked item."""
+
+    item_activated = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -850,6 +886,37 @@ class ToolTopListWidget(QFrame):
         layout.addStretch(1)
         return header
 
+    def _set_rows(self, rows: Sequence[RankedRow]) -> None:
+        while self._layout.count() > 1:
+            item = self._layout.takeAt(1)
+            if item is None:
+                break
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        for row in rows:
+            row.activated.connect(self.item_activated.emit)
+            self._layout.addWidget(row)
+
+    def rows(self) -> list[RankedRow]:
+        result: list[RankedRow] = []
+        for index in range(self._layout.count()):
+            item = self._layout.itemAt(index)
+            widget = item.widget() if item is not None else None
+            if isinstance(widget, RankedRow):
+                result.append(widget)
+        return result
+
+
+class ToolTopListWidget(RankedListWidget):
+    """Ranked list of the largest tools with table-matched size states."""
+
+    tool_focus_requested = Signal(object)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.item_activated.connect(self.tool_focus_requested.emit)
+
     def set_tools(
         self,
         tools: Sequence[Tool],
@@ -858,28 +925,41 @@ class ToolTopListWidget(QFrame):
         used_set: set[str] | None = None,
         usage_known: bool = True,
     ) -> None:
-        while self._layout.count() > 1:
-            item = self._layout.takeAt(1)
-            if item is None:
-                break
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-        for rank, tool in enumerate(tools, start=1):
-            row = ToolTopRow(
-                rank, tool, tool_size_text(tool, pending, failed), used_set, usage_known, self
-            )
-            row.activated.connect(self.tool_focus_requested.emit)
-            self._layout.addWidget(row)
+        self._set_rows(
+            [
+                ToolTopRow(
+                    rank, tool, tool_size_text(tool, pending, failed), used_set, usage_known, self
+                )
+                for rank, tool in enumerate(tools, start=1)
+            ]
+        )
 
-    def rows(self) -> list[ToolTopRow]:
-        result: list[ToolTopRow] = []
-        for index in range(self._layout.count()):
-            item = self._layout.itemAt(index)
-            widget = item.widget() if item is not None else None
-            if isinstance(widget, ToolTopRow):
-                result.append(widget)
-        return result
+
+class ShaderTopListWidget(RankedListWidget):
+    """Ranked list of the largest shader caches, dotted by Steam/non-Steam/orphaned."""
+
+    cache_focus_requested = Signal(object)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.item_activated.connect(self.cache_focus_requested.emit)
+
+    def set_caches(
+        self, caches: Sequence[ShaderCache], pending: set[str], failed: set[str]
+    ) -> None:
+        self._set_rows(
+            [
+                RankedRow(
+                    rank,
+                    cache,
+                    cache.name,
+                    cache.cache_type,
+                    _path_size_text(str(cache.path), cache.size_bytes, pending, failed),
+                    self,
+                )
+                for rank, cache in enumerate(caches, start=1)
+            ]
+        )
 
 
 class SummaryCard(QFrame):
@@ -1031,6 +1111,8 @@ class OverviewPage(QScrollArea):
     prefix_focus_requested = Signal(object)
     tool_review_requested = Signal()
     tool_focus_requested = Signal(object)
+    shader_review_requested = Signal()
+    shader_focus_requested = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1039,6 +1121,7 @@ class OverviewPage(QScrollArea):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._orphan_count = 0
         self._reclaimable_count = 0
+        self._shader_orphan_count = 0
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.setContentsMargins(
@@ -1148,7 +1231,81 @@ class OverviewPage(QScrollArea):
         self._tools_status_label.setWordWrap(True)
         layout.addWidget(self._tools_status_label)
 
+        self._build_shaders_section(content, layout)
         self.setWidget(content)
+
+    def _build_shaders_section(self, content: QWidget, layout: QVBoxLayout) -> None:
+        separator = QFrame(content)
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(separator)
+        layout.addWidget(_section_header("Shader caches", content))
+
+        cards_row = QHBoxLayout()
+        cards_row.setSpacing(OVERVIEW_CARD_SPACING_PX)
+        self._shaders_card = SummaryCard("SHADER CACHES", parent=self)
+        self._shader_orphan_card = SummaryCard(
+            "ORPHANED",
+            dominant=True,
+            clickable=True,
+            tooltip=_SHADER_ORPHAN_CARD_TOOLTIP,
+            disabled_tooltip=_SHADER_ORPHAN_CARD_EMPTY_TOOLTIP,
+            parent=self,
+        )
+        self._shaders_disk_card = SummaryCard("SHADERS DISK USAGE", parent=self)
+        self._shader_orphan_card.clicked.connect(self._on_shader_orphan_card_clicked)
+        cards_row.addWidget(self._shaders_card, stretch=1)
+        cards_row.addWidget(self._shader_orphan_card, stretch=1)
+        cards_row.addWidget(self._shaders_disk_card, stretch=1)
+        layout.addLayout(cards_row)
+
+        heading = QLabel("Largest shader caches", content)
+        heading_font = QFont(heading.font())
+        heading_font.setBold(True)
+        heading.setFont(heading_font)
+        layout.addWidget(heading)
+
+        self._shaders_top_list = ShaderTopListWidget(content)
+        self._shaders_top_list.cache_focus_requested.connect(self.shader_focus_requested.emit)
+        layout.addWidget(self._shaders_top_list)
+
+        self._shaders_status_label = SecondaryLabel("", content)
+        self._shaders_status_label.setWordWrap(True)
+        layout.addWidget(self._shaders_status_label)
+        self.update_shaders([], set(), set(), None)
+
+    def _on_shader_orphan_card_clicked(self) -> None:
+        if self._shader_orphan_count > 0:
+            self.shader_review_requested.emit()
+
+    def update_shaders(
+        self,
+        caches: Sequence[ShaderCache],
+        pending: set[str],
+        failed: set[str],
+        capacity_bytes: int | None,
+    ) -> None:
+        """Refresh only the shader cache section."""
+        total = sum(cache.size_bytes for cache in caches)
+        orphans = [cache for cache in caches if cache.is_orphan]
+        orphan_bytes = sum(cache.size_bytes for cache in orphans)
+        self._shader_orphan_count = len(orphans)
+        self._shaders_card.set_values(str(len(caches)), format_size(total))
+        noun = "cache" if len(orphans) == 1 else "caches"
+        self._shader_orphan_card.set_values(
+            format_size(orphan_bytes), f"{len(orphans)} orphaned {noun}"
+        )
+        self._shader_orphan_card.set_clickable_enabled(bool(orphans))
+        if capacity_bytes is not None:
+            self._shaders_disk_card.set_values(
+                f"{format_size(total)} of {format_size(capacity_bytes)}",
+                f"{format_percent(total, capacity_bytes)} of disk",
+            )
+        else:
+            self._shaders_disk_card.set_values(format_size(total), "disk size unknown")
+        largest = sorted(caches, key=lambda cache: (-cache.size_bytes, cache.name.casefold()))
+        self._shaders_top_list.set_caches(largest[:OVERVIEW_TOP_ROWS], pending, failed)
+        self._shaders_status_label.setText(_shader_scan_status_text(caches, pending, failed))
 
     def _on_orphan_card_clicked(self) -> None:
         if self._orphan_count > 0:
@@ -1355,3 +1512,23 @@ class OverviewPage(QScrollArea):
     @property
     def tools_status_label(self) -> QLabel:
         return self._tools_status_label
+
+    @property
+    def shaders_card(self) -> SummaryCard:
+        return self._shaders_card
+
+    @property
+    def shader_orphan_card(self) -> SummaryCard:
+        return self._shader_orphan_card
+
+    @property
+    def shaders_disk_card(self) -> SummaryCard:
+        return self._shaders_disk_card
+
+    @property
+    def shaders_top_list(self) -> ShaderTopListWidget:
+        return self._shaders_top_list
+
+    @property
+    def shaders_status_label(self) -> QLabel:
+        return self._shaders_status_label
