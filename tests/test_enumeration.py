@@ -330,24 +330,30 @@ def test_appid_zero_ignored_across_libraries(tmp_path: Path) -> None:
     assert len(prefixes) == 2
 
 
-def test_symlinked_compatdata_directory_ignored(tmp_path: Path) -> None:
+def test_symlinked_compatdata_directory_listed_read_only(tmp_path: Path) -> None:
     outside_compatdata = tmp_path / "outside_compatdata"
     (outside_compatdata / "480").mkdir(parents=True)
     lib_path = tmp_path / "SteamLibrary"
     (lib_path / "steamapps").mkdir(parents=True)
     (lib_path / "steamapps" / "compatdata").symlink_to(outside_compatdata, target_is_directory=True)
     lib = Library(path=lib_path.resolve(), root=tmp_path.resolve())
-    assert enumerate_prefixes([lib]) == []
+    prefixes = enumerate_prefixes([lib])
+    assert [p.app_id for p in prefixes] == [480]
+    assert prefixes[0].on_symlinked_library
+    assert not prefixes[0].deletable
 
 
-def test_symlinked_steamapps_directory_ignored(tmp_path: Path) -> None:
+def test_symlinked_steamapps_directory_listed_read_only(tmp_path: Path) -> None:
     outside_steamapps = tmp_path / "outside_steamapps"
     (outside_steamapps / "compatdata" / "480").mkdir(parents=True)
     lib_path = tmp_path / "SteamLibrary"
     lib_path.mkdir(parents=True)
     (lib_path / "steamapps").symlink_to(outside_steamapps, target_is_directory=True)
     lib = Library(path=lib_path.resolve(), root=tmp_path.resolve())
-    assert enumerate_prefixes([lib]) == []
+    prefixes = enumerate_prefixes([lib])
+    assert [p.app_id for p in prefixes] == [480]
+    assert prefixes[0].on_symlinked_library
+    assert not prefixes[0].deletable
 
 
 def test_symlinked_compatdata_paths_reports_only_symlinks(tmp_path: Path) -> None:
@@ -370,3 +376,39 @@ def test_symlinked_compatdata_paths_reports_only_symlinks(tmp_path: Path) -> Non
         linked / "steamapps" / "compatdata",
         linked_steamapps / "steamapps",
     ]
+
+
+def test_symlinked_library_skips_symlinked_entries(tmp_path: Path) -> None:
+    outside_compatdata = tmp_path / "outside_compatdata"
+    (outside_compatdata / "480").mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere" / "999"
+    elsewhere.mkdir(parents=True)
+    (outside_compatdata / "999").symlink_to(elsewhere, target_is_directory=True)
+    lib_path = tmp_path / "SteamLibrary"
+    (lib_path / "steamapps").mkdir(parents=True)
+    (lib_path / "steamapps" / "compatdata").symlink_to(outside_compatdata, target_is_directory=True)
+    lib = Library(path=lib_path.resolve(), root=tmp_path.resolve())
+    assert [p.app_id for p in enumerate_prefixes([lib])] == [480]
+
+
+def test_broken_compatdata_symlink_lists_nothing(tmp_path: Path) -> None:
+    lib_path = tmp_path / "SteamLibrary"
+    (lib_path / "steamapps").mkdir(parents=True)
+    (lib_path / "steamapps" / "compatdata").symlink_to(tmp_path / "missing")
+    lib = Library(path=lib_path.resolve(), root=tmp_path.resolve())
+    assert enumerate_prefixes([lib]) == []
+
+
+def test_real_library_row_wins_over_symlinked_alias(tmp_path: Path) -> None:
+    real = _make_library(tmp_path, "Real", app_ids=(480,))
+    linked_path = tmp_path / "Linked"
+    (linked_path / "steamapps").mkdir(parents=True)
+    (linked_path / "steamapps" / "compatdata").symlink_to(
+        real.path / "steamapps" / "compatdata", target_is_directory=True
+    )
+    linked = Library(path=linked_path.resolve(), root=tmp_path.resolve())
+    for order in ([linked, real], [real, linked]):
+        prefixes = enumerate_prefixes(order)
+        assert len(prefixes) == 1
+        assert prefixes[0].deletable
+        assert prefixes[0].library == str(real.path)

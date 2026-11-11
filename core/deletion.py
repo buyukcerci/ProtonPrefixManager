@@ -182,7 +182,9 @@ def iter_delete_prefixes(
         first = aliases[0]
         target = grouped[key][0][1]
         expanded = [alias.path.expanduser() for alias in aliases]
-        if any(raw.is_symlink() or _unresolved_parent_has_symlink(raw) for raw in expanded):
+        if any(alias.on_symlinked_library for alias in aliases) or any(
+            raw.is_symlink() or _unresolved_parent_has_symlink(raw) for raw in expanded
+        ):
             yield DeletionResult(
                 prefix=first,
                 mode=mode,

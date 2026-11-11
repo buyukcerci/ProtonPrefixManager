@@ -375,3 +375,16 @@ def test_store_sort_by_modified_ties_broken_by_size_then_app_id() -> None:
     assert [p.app_id for p in store.prefixes] == [2, 3, 1]
     store.sort(key="modified", descending=False)
     assert [p.app_id for p in store.prefixes] == [2, 3, 1]
+
+
+def test_store_never_selects_read_only_prefixes() -> None:
+    store = Store()
+    writable = _prefix(app_id=1)
+    read_only = replace(_prefix(app_id=2), on_symlinked_library=True)
+    store.merge([writable, read_only])
+    store.select(read_only)
+    assert store.selected() == []
+    store.select_visible(store.prefixes)
+    assert [p.app_id for p in store.selected()] == [1]
+    # The header state ignores rows that can never be selected.
+    assert store.selection_state() is SelectionState.ALL

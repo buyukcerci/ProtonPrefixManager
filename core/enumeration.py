@@ -144,17 +144,26 @@ def enumerate_prefixes(
     normalization as Store._dedupe_key. Symlinked compatdata children are
     intentionally skipped instead of followed, so prefixes relocated via
     symlinks are never listed outside their library. A library whose
-    steamapps or compatdata directory is itself a symlink is skipped the
-    same way; symlinked_compatdata_paths reports those so callers can warn.
-    Unreadable or missing compatdata directories are skipped silently.
+    steamapps or compatdata directory is itself a symlink is listed through
+    the link, read-only: its rows carry on_symlinked_library, cannot be
+    selected, and are refused by deletion; symlinked_compatdata_paths
+    reports those libraries so callers can say why. Unreadable or missing
+    compatdata directories are skipped silently.
     """
     shortcuts = dict(shortcuts_map) if shortcuts_map is not None else _load_shortcuts(roots or ())
     prefixes: list[Prefix] = []
-    seen: set[tuple[int, str]] = set()
+    seen: dict[tuple[int, str], int] = {}
     for library in libraries:
         compatdata = library_compatdata_dir(library)
+        via_symlink = False
         if compatdata is None:
-            continue
+            # A symlinked steamapps or compatdata (the usual NTFS-library
+            # setup) is followed for listing only; the rows are marked so
+            # they can never be selected, and deletion refuses them anyway.
+            if compatdata_symlink(library.path) is None:
+                continue
+            compatdata = library.path / STEAMAPPS_DIR / COMPATDATA_DIR
+            via_symlink = True
         try:
             entries = sorted(compatdata.iterdir(), key=lambda entry: entry.name)
         except OSError:
@@ -171,9 +180,17 @@ def enumerate_prefixes(
             path = entry.resolve(strict=False)
             key = (app_id, str(path).rstrip("/"))
             if key in seen:
+                # A symlinked library can point at another library's real
+                # compatdata; the directly reachable row wins so the prefix
+                # stays deletable from its real location.
+                index = seen[key]
+                if prefixes[index].on_symlinked_library and not via_symlink:
+                    prefixes[index] = _classify(app_id, path, library, shortcuts)
                 continue
-            seen.add(key)
-            prefixes.append(_classify(app_id, path, library, shortcuts))
+            seen[key] = len(prefixes)
+            prefix = _classify(app_id, path, library, shortcuts)
+            prefix.on_symlinked_library = via_symlink
+            prefixes.append(prefix)
     return prefixes
 
 

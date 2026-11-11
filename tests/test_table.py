@@ -331,3 +331,25 @@ def test_set_store_and_set_rows_survive_permission_error_on_is_dir(
     assert model.rowCount() == 2
     assert model.open_enabled(0) is False
     assert model.open_enabled(1) is True
+
+
+def test_read_only_prefix_row_has_no_checkbox(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from PySide6.QtCore import Qt
+
+    from ui.table import CHECK_COLUMN
+
+    locked = replace(_make_prefix(tmp_path, "locked", 300), on_symlinked_library=True)
+    store = Store()
+    store.merge([locked])
+    model = PrefixTableModel()
+    model.set_store(store)
+    index = model.index(0, CHECK_COLUMN)
+    assert index.data(Qt.ItemDataRole.CheckStateRole) is None
+    assert not model.flags(index) & Qt.ItemFlag.ItemIsUserCheckable
+    assert "symlink" in index.data(Qt.ItemDataRole.ToolTipRole)
+    assert not model.setData(
+        index, int(Qt.CheckState.Checked.value), Qt.ItemDataRole.CheckStateRole
+    )
+    assert store.selected() == []

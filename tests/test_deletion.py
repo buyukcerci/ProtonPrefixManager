@@ -414,3 +414,14 @@ def test_iter_delete_prefixes_yields_before_later_targets_run(
     assert len(trash_calls) == 1
     assert next(results).status is DeletionStatus.DELETED
     assert len(trash_calls) == 2
+
+
+def test_delete_rejects_prefix_flagged_on_symlinked_library(
+    tmp_path: Path, trash_calls: list[Path]
+) -> None:
+    library, compatdata = _make_library(tmp_path)
+    prefix = _make_prefix(compatdata, 480)
+    prefix.on_symlinked_library = True
+    results = delete_prefixes([prefix], [library])
+    assert results[0].reject_reason is RejectReason.SYMLINK
+    assert trash_calls == []

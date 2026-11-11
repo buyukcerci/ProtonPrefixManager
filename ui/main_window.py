@@ -1171,13 +1171,10 @@ class MainWindow(QMainWindow):
         # Prefix enumeration and deletion refuse symlinked steamapps or
         # compatdata directories; say so instead of showing an empty library.
         for link in symlinked_compatdata_paths(self._libraries):
-            contents = "prefixes and shader caches" if link.name == "steamapps" else "prefixes"
-            self._enumeration_warnings.append(
-                EnumerationWarning(
-                    message=f"symlinked Steam directory skipped; its {contents} are not listed",
-                    path=link,
-                )
-            )
+            message = "symlinked Steam directory: its prefixes are listed read-only"
+            if link.name == "steamapps":
+                message += " and its shader caches are not listed"
+            self._enumeration_warnings.append(EnumerationWarning(message=message, path=link))
         self._start_shader_enumeration(epoch)
         self._discovery_errors = list(result.errors)
         for warning in self._enumeration_warnings:

@@ -56,6 +56,16 @@ class Prefix:
     last_scanned: datetime | None = None
     modified: datetime | None = None
     is_runtime_component: bool = False
+    on_symlinked_library: bool = False
+
+    @property
+    def deletable(self) -> bool:
+        """False for prefixes reached through a symlinked steamapps or compatdata.
+
+        Those are listed so their space is visible, but the app never deletes
+        through a symlink, so they can never be selected.
+        """
+        return not self.on_symlinked_library
 
     @property
     def is_orphan(self) -> bool:
@@ -190,7 +200,8 @@ class Store:
         self._prefixes[:] = [item[3] for item in ranked] + unknown
 
     def select(self, prefix: Prefix) -> None:
-        self._selected.add(_dedupe_key(prefix))
+        if prefix.deletable:
+            self._selected.add(_dedupe_key(prefix))
 
     def deselect(self, prefix: Prefix) -> None:
         self._selected.discard(_dedupe_key(prefix))
@@ -199,7 +210,8 @@ class Store:
         for prefix in prefixes:
             if exclude_runtime and prefix.is_runtime_component:
                 continue
-            self._selected.add(_dedupe_key(prefix))
+            if prefix.deletable:
+                self._selected.add(_dedupe_key(prefix))
 
     def clear_selection(self) -> None:
         self._selected.clear()
@@ -208,7 +220,9 @@ class Store:
         return _dedupe_key(prefix) in self._selected
 
     def selected(self) -> list[Prefix]:
-        return [prefix for prefix in self._prefixes if self.is_selected(prefix)]
+        return [
+            prefix for prefix in self._prefixes if prefix.deletable and self.is_selected(prefix)
+        ]
 
     def selection_state(
         self,
@@ -217,6 +231,7 @@ class Store:
         exclude_runtime: bool = False,
     ) -> SelectionState:
         rows = list(visible) if visible is not None else self._prefixes
+        rows = [p for p in rows if p.deletable]
         if exclude_runtime:
             rows = [p for p in rows if not p.is_runtime_component]
         if not rows:

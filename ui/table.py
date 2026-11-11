@@ -77,6 +77,10 @@ _HEADER_LABELS = {
 
 _OPEN_DISABLED_TOOLTIP = "path no longer exists"
 _SIZE_FAILED_TOOLTIP = "size scan failed"
+_SYMLINKED_LIBRARY_TOOLTIP = (
+    "Read-only: this prefix is reached through a symlinked steamapps or compatdata "
+    "folder, and this app never deletes through symlinks."
+)
 _RUNTIME_COMPONENT_TOOLTIP = (
     "Created by Steam for its own runtime; safe to delete, "
     "recreated by Steam on next launch if needed."
@@ -230,6 +234,16 @@ class PrefixTableModel(QAbstractTableModel):
                 return QBrush(palette.color(QPalette.ColorRole.HighlightedText))
         if role == Qt.ItemDataRole.DisplayRole:
             return self._display_text(prefix, index.row(), column)
+        if column == CHECK_COLUMN and not prefix.deletable:
+            # Read-only rows render a lock-style info icon instead of a box.
+            if role == Qt.ItemDataRole.ToolTipRole:
+                return _SYMLINKED_LIBRARY_TOOLTIP
+            if role == Qt.ItemDataRole.DecorationRole and QApplication.instance() is not None:
+                return QApplication.style().standardIcon(
+                    QStyle.StandardPixmap.SP_MessageBoxInformation
+                )
+            if role == Qt.ItemDataRole.CheckStateRole:
+                return None
         if column == CHECK_COLUMN and role == Qt.ItemDataRole.CheckStateRole:
             selected = self._store.is_selected(prefix)
             state = Qt.CheckState.Checked if selected else Qt.CheckState.Unchecked
@@ -252,6 +266,9 @@ class PrefixTableModel(QAbstractTableModel):
     def flags(self, index: QModelIndex | QPersistentModelIndex) -> Qt.ItemFlag:
         base = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
         if index.column() == CHECK_COLUMN:
+            prefix = self.row_at(index.row())
+            if prefix is not None and not prefix.deletable:
+                return base
             return base | Qt.ItemFlag.ItemIsUserCheckable
         return base
 
@@ -264,7 +281,7 @@ class PrefixTableModel(QAbstractTableModel):
         if role != Qt.ItemDataRole.CheckStateRole or index.column() != CHECK_COLUMN:
             return False
         prefix = self.row_at(index.row())
-        if prefix is None:
+        if prefix is None or not prefix.deletable:
             return False
         checked = value in (Qt.CheckState.Checked, int(Qt.CheckState.Checked.value), True)
         if checked:
