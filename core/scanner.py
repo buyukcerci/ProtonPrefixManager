@@ -113,7 +113,12 @@ class ScanResult:
 
 
 def cache_key(target: Prefix | Path) -> str:
-    """Normalized cache key matching Store._dedupe_key path semantics."""
+    """Normalized cache key matching Store._dedupe_key path semantics.
+
+    Resolving touches the filesystem, so callers on a UI thread should
+    compute a key once (ideally off-thread) and pass it to the cache
+    functions below through their key parameter.
+    """
     path = target.path if isinstance(target, Prefix) else target
     return str(path.resolve(strict=False)).rstrip("/")
 
@@ -126,14 +131,15 @@ def _is_usable_entry(entry: CacheEntry | None) -> bool:
     return entry is not None and entry.size_bytes != 0
 
 
-def load_cached(cache: dict[str, dict], prefix: Prefix) -> Prefix | None:
+def load_cached(cache: dict[str, dict], prefix: Prefix, *, key: str | None = None) -> Prefix | None:
     """Return a scanned copy of prefix when a valid nonzero cache entry exists.
 
     Entries with size_bytes == 0 are treated as misses: a zero may have
     been captured before the prefix was populated, and replaying it would
-    pin the stale total forever.
+    pin the stale total forever. key is a precomputed cache_key(prefix);
+    when omitted it is computed here, which resolves the path on disk.
     """
-    entry = CacheEntry.from_dict(cache.get(cache_key(prefix)))
+    entry = CacheEntry.from_dict(cache.get(key if key is not None else cache_key(prefix)))
     if not _is_usable_entry(entry):
         return None
     assert entry is not None  # narrowed by _is_usable_entry
@@ -146,7 +152,7 @@ def load_cached(cache: dict[str, dict], prefix: Prefix) -> Prefix | None:
     )
 
 
-def save_cached(cache: dict[str, dict], prefix: Prefix) -> None:
+def save_cached(cache: dict[str, dict], prefix: Prefix, *, key: str | None = None) -> None:
     """Store prefix's scan outcome under its cache key, mutating cache in place.
 
     The caller remains responsible for persisting via AppConfig.save_config.
@@ -159,10 +165,10 @@ def save_cached(cache: dict[str, dict], prefix: Prefix) -> None:
     }
     if prefix.modified is not None:
         entry["modified"] = prefix.modified.isoformat()
-    cache[cache_key(prefix)] = entry
+    cache[key if key is not None else cache_key(prefix)] = entry
 
 
-def record_scan(cache: dict[str, dict], prefix: Prefix) -> None:
+def record_scan(cache: dict[str, dict], prefix: Prefix, *, key: str | None = None) -> None:
     """Persist one completed scan: save a nonzero sized result, else drop the entry.
 
     Zero sizes are never cached (see load_cached), and a prefix without a
@@ -170,17 +176,19 @@ def record_scan(cache: dict[str, dict], prefix: Prefix) -> None:
     place that rule lives; both the scanner and the UI call it.
     """
     if prefix.size_bytes != 0 and prefix.last_scanned is not None:
-        save_cached(cache, prefix)
+        save_cached(cache, prefix, key=key)
     else:
-        invalidate(cache, prefix)
+        invalidate(cache, prefix, key=key)
 
 
-def invalidate(cache: dict[str, dict], target: Prefix | Path) -> None:
+def invalidate(cache: dict[str, dict], target: Prefix | Path, *, key: str | None = None) -> None:
     """Remove the cache entry for target if present."""
-    cache.pop(cache_key(target), None)
+    cache.pop(key if key is not None else cache_key(target), None)
 
 
-def refresh_needed(cache: dict[str, dict], prefix: Prefix, force: bool = False) -> bool:
+def refresh_needed(
+    cache: dict[str, dict], prefix: Prefix, force: bool = False, *, key: str | None = None
+) -> bool:
     """True when force is set, the entry is missing, or the cached size is zero.
 
     Zero entries are deliberately distrusted because they may predate
@@ -190,7 +198,7 @@ def refresh_needed(cache: dict[str, dict], prefix: Prefix, force: bool = False) 
     """
     if force:
         return True
-    entry = CacheEntry.from_dict(cache.get(cache_key(prefix)))
+    entry = CacheEntry.from_dict(cache.get(key if key is not None else cache_key(prefix)))
     return not _is_usable_entry(entry)
 
 

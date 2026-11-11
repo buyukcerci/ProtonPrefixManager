@@ -508,3 +508,53 @@ def test_prefix_size_tooltip_mentions_shader_cache(qtbot, tmp_path: Path) -> Non
     }
     assert tooltips[730] is not None and "shader cache" in tooltips[730]
     assert tooltips[440] is None
+
+
+def test_focus_cache_defers_scroll_and_survives_row_removal(qtbot, tmp_path: Path) -> None:
+    lib = _library(tmp_path)
+    target = _cache(lib, 1, PrefixType.STEAM, "Alpha")
+    page = _page(qtbot)
+    page.set_data([target, _cache(lib, 2, PrefixType.STEAM, "Beta")], [lib])
+    scrolled: list[int] = []
+    page.table.scrollTo = lambda index, hint=None: scrolled.append(index.row())  # type: ignore[method-assign]
+    page.focus_cache(target)
+    assert scrolled == []  # deferred until the tab has laid out
+    assert page._scroll_timer.isActive()
+    page._scroll_timer.timeout.emit()
+    assert len(scrolled) == 1
+    # A row that vanished before the timer fires must not scroll elsewhere.
+    page.focus_cache(target)
+    page.set_status_filter(set())
+    page._scroll_to_pending_focus()
+    assert len(scrolled) == 1
+
+
+def test_window_uses_worker_cache_keys_without_resolving(
+    qtbot, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from core.models import prefix_key
+    from tests.test_window import _synthetic_payload
+    from ui import main_window as main_window_module
+    from ui.main_window import MainWindow
+
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    result, prefixes = _synthetic_payload(tmp_path)
+
+    class _Worker:
+        cache_keys = {prefix_key(p): str(p.path) for p in prefixes}
+
+    def fail(target):
+        raise AssertionError("cache_key resolved on the UI thread")
+
+    monkeypatch.setattr(main_window_module, "cache_key", fail)
+    monkeypatch.setattr(
+        main_window_module.QThreadPool,
+        "globalInstance",
+        lambda: type(
+            "_Pool", (), {"start": lambda self, w: None, "waitForDone": lambda self, ms=-1: True}
+        )(),
+    )
+    window._on_discovery_finished((result, prefixes), window._epoch, _Worker())
+    assert window._cache_key_for(prefixes[0]) == str(prefixes[0].path)
+    assert window._scan_error_for(prefixes[0]) is None

@@ -8,16 +8,13 @@ from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QAbstractTableModel,
-    QModelIndex,
-    QPersistentModelIndex,
     QRunnable,
     Qt,
     QThreadPool,
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QAction, QBrush, QIcon, QPalette
+from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -79,6 +76,11 @@ from core.tools import (
     is_reclaimable,
     used_by,
 )
+from ui.checkable_model import (
+    SizedCheckableModel,
+    position_header_checkbox,
+    sync_header_checkbox,
+)
 from ui.dialogs import (
     confirm_final,
     confirm_selection,
@@ -92,7 +94,6 @@ from ui.settings import SettingsDialog
 from ui.shaders_page import ShadersPage
 from ui.styles import (
     CHECK_WIDTH_PX,
-    HIGHLIGHT_DURATION_MS,
     MESSAGE_ICON_SIZE_PX,
     MESSAGE_LAYOUT_SPACING_PX,
     MESSAGE_PAGE_MARGIN_PX,
@@ -182,8 +183,6 @@ _TOOL_STATUS_FILTERS = (
     _TOOL_STATUS_UNKNOWN,
 )
 
-_TOOL_MODEL_ROOT_INDEX = QModelIndex()
-
 
 def _tool_status(tool: Tool, used: set[str], *, usage_known: bool) -> str:
     if str(tool.path) in used:
@@ -217,7 +216,7 @@ def _tool_facets(tool: Tool, used: set[str], *, usage_known: bool) -> set[str]:
     return facets
 
 
-class ToolTableModel(QAbstractTableModel):
+class ToolTableModel(SizedCheckableModel[Tool]):
     """Read-only tool rows with checkboxes limited to deletable tools.
 
     Only unused writable tools with a successfully loaded usage mapping
@@ -226,24 +225,24 @@ class ToolTableModel(QAbstractTableModel):
     every tool renders as Unknown and nothing is checkable. A writable
     tool whose own description could not be read also renders as Unknown
     and stays unchecked, because the mapping may select the display name
-    that tool could not resolve.
+    that tool could not resolve. Selection, size states and the row
+    highlight come from SizedCheckableModel.
     """
 
-    selection_changed = Signal()
+    check_column = _TOOL_CHECK_COLUMN
+    size_column = _TOOL_SIZE_COLUMN
+    column_count = _TOOL_COLUMN_COUNT
+    header_labels = _TOOL_HEADER_LABELS
 
     def __init__(self) -> None:
         super().__init__()
-        self._tools: list[Tool] = []
         self._used_by: dict[str, list[int]] = {}
         self._names: dict[int, str] = {}
-        self._pending: set[str] = set()
-        self._failed: set[str] = set()
-        self._selected: set[str] = set()
         self._usage_known = True
-        self._highlighted_path: str | None = None
-        self._highlight_timer = QTimer(self)
-        self._highlight_timer.setSingleShot(True)
-        self._highlight_timer.timeout.connect(self.clear_highlight)
+
+    @property
+    def _tools(self) -> list[Tool]:
+        return self._rows
 
     def set_items(
         self,
@@ -253,13 +252,10 @@ class ToolTableModel(QAbstractTableModel):
         usage_known: bool = True,
     ) -> None:
         self.beginResetModel()
-        self._tools = list(tools)
         self._used_by = dict(used_by)
         self._names = dict(names)
         self._usage_known = usage_known
-        self._pending = {str(tool.path) for tool in tools}
-        self._failed.clear()
-        self._selected.clear()
+        self._reset_rows(tools)
         self.endResetModel()
         self.selection_changed.emit()
 
@@ -271,233 +267,36 @@ class ToolTableModel(QAbstractTableModel):
     def used(self) -> set[str]:
         return set(self._used_by)
 
-    @property
-    def pending(self) -> set[str]:
-        return set(self._pending)
-
-    @property
-    def failed(self) -> set[str]:
-        return set(self._failed)
-
     def set_tool_size(self, path: str, size_bytes: int, error: str | None) -> None:
         """Store one async size result and refresh its size cell."""
-        self._pending.discard(path)
-        if error is not None:
-            self._failed.add(path)
-        else:
-            self._failed.discard(path)
-        for row, tool in enumerate(self._tools):
-            if str(tool.path) == path:
-                self._tools[row] = replace(tool, size_bytes=size_bytes)
-                self.dataChanged.emit(
-                    self.index(row, _TOOL_SIZE_COLUMN),
-                    self.index(row, _TOOL_SIZE_COLUMN),
-                )
-                return
-
-    def mark_pending_unavailable(self) -> None:
-        """Move leftover pending rows to failed so none stay Scanning.
-
-        Called when the size worker finishes without reporting a row
-        (worker never started, stopped early, or dropped a signal).
-        Failed rows render as Unavailable, never as a false zero size.
-        """
-        if not self._pending:
-            return
-        self._failed.update(self._pending)
-        self._pending.clear()
-        if self._tools:
-            self.dataChanged.emit(
-                self.index(0, _TOOL_SIZE_COLUMN),
-                self.index(len(self._tools) - 1, _TOOL_SIZE_COLUMN),
-            )
+        self.set_size(path, size_bytes, failed=error is not None)
 
     def selected_tools(self) -> list[Tool]:
-        return [tool for tool in self._tools if str(tool.path) in self._selected]
-
-    def highlight_row(self, tool: Tool) -> None:
-        """Mark one row as highlighted for a short window (no selection change).
-
-        A highlight that moves from another row first clears that row's
-        highlight state, so the old row stops painting highlighted
-        instead of waiting for an unrelated repaint.
-        """
-        previous = self._highlighted_path
-        if previous is not None and previous != str(tool.path):
-            self._emit_rows_changed_for(previous)
-        self._highlighted_path = str(tool.path)
-        self._emit_rows_changed_for(self._highlighted_path)
-        self._highlight_timer.start(HIGHLIGHT_DURATION_MS)
-
-    def clear_highlight(self) -> None:
-        path = self._highlighted_path
-        if path is None:
-            return
-        self._highlighted_path = None
-        self._emit_rows_changed_for(path)
+        return self.selected_items()
 
     def highlighted_path(self) -> str | None:
-        return self._highlighted_path
-
-    def _emit_rows_changed_for(self, path: str) -> None:
-        for row, tool in enumerate(self._tools):
-            if str(tool.path) == path:
-                self.dataChanged.emit(
-                    self.index(row, _TOOL_CHECK_COLUMN),
-                    self.index(row, _TOOL_STATUS_COLUMN),
-                )
-                return
-
-    def rows(self) -> list[Tool]:
-        return list(self._tools)
-
-    def is_selected(self, tool: Tool) -> bool:
-        return str(tool.path) in self._selected
+        return self.highlighted_key()
 
     def is_deletable(self, tool: Tool) -> bool:
         return is_reclaimable(tool, self.used, usage_known=self._usage_known)
 
-    def set_visible(self, tools: Sequence[Tool]) -> None:
-        """Re-slice visible rows, dropping selections hidden by the filter.
-
-        A highlight never survives a filter change: the stored path is
-        cleared and its timer stopped alongside the selection pruning,
-        and the old path still emits dataChanged afterwards so the view
-        repaints the row without the highlight colors.
-        """
-        previous = self._highlighted_path
-        self._highlighted_path = None
-        self._highlight_timer.stop()
-        self.beginResetModel()
-        self._tools = list(tools)
-        visible = {str(tool.path) for tool in tools}
-        self._selected = {key for key in self._selected if key in visible}
-        self.endResetModel()
-        if previous is not None:
-            self._emit_rows_changed_for(previous)
-        self.selection_changed.emit()
-
-    def set_visible_deletable_selected(self, selected: bool) -> None:
-        """Check or clear every deletable visible row."""
-        for tool in self._tools:
-            if self.is_deletable(tool):
-                key = str(tool.path)
-                if selected:
-                    self._selected.add(key)
-                else:
-                    self._selected.discard(key)
-        if self._tools:
-            self.dataChanged.emit(
-                self.index(0, _TOOL_CHECK_COLUMN),
-                self.index(len(self._tools) - 1, _TOOL_CHECK_COLUMN),
-            )
-        self.selection_changed.emit()
-
-    def rowCount(self, parent: QModelIndex | QPersistentModelIndex = _TOOL_MODEL_ROOT_INDEX) -> int:
-        return 0 if parent.isValid() else len(self._tools)
-
-    def columnCount(
-        self, parent: QModelIndex | QPersistentModelIndex = _TOOL_MODEL_ROOT_INDEX
-    ) -> int:
-        return _TOOL_COLUMN_COUNT
-
-    def data(
-        self,
-        index: QModelIndex | QPersistentModelIndex,
-        role: int = Qt.ItemDataRole.DisplayRole,
-    ) -> object:
-        if not index.isValid():
-            return None
-        if not 0 <= index.row() < len(self._tools):
-            return None
-        tool = self._tools[index.row()]
-        column = index.column()
-        if self._highlighted_path is not None and str(tool.path) == self._highlighted_path:
-            if role == Qt.ItemDataRole.BackgroundRole:
-                palette = QApplication.palette()
-                return QBrush(palette.color(QPalette.ColorRole.Highlight))
-            if role == Qt.ItemDataRole.ForegroundRole:
-                palette = QApplication.palette()
-                return QBrush(palette.color(QPalette.ColorRole.HighlightedText))
-        if role == Qt.ItemDataRole.DisplayRole:
-            return self._display_text(tool, column)
-        if column == _TOOL_CHECK_COLUMN and role == Qt.ItemDataRole.CheckStateRole:
-            if not self.is_deletable(tool):
-                return None
-            selected = str(tool.path) in self._selected
-            state = Qt.CheckState.Checked if selected else Qt.CheckState.Unchecked
-            return int(state.value)
+    def _extra_data(self, tool: Tool, column: int, role: int) -> object:
         if role == Qt.ItemDataRole.ToolTipRole and column == _TOOL_NAME_COLUMN:
             return self._name_tooltip(tool)
-        if role == Qt.ItemDataRole.ToolTipRole and column == _TOOL_CHECK_COLUMN:
-            if not self.is_deletable(tool):
-                return self._lock_reason(tool)
-        if (
-            column == _TOOL_CHECK_COLUMN
-            and role == Qt.ItemDataRole.DecorationRole
-            and not self.is_deletable(tool)
-            and QApplication.instance() is not None
-        ):
+        if column != _TOOL_CHECK_COLUMN or self.is_deletable(tool):
+            return None
+        if role == Qt.ItemDataRole.ToolTipRole:
+            return self._lock_reason(tool)
+        if role == Qt.ItemDataRole.DecorationRole and QApplication.instance() is not None:
             icon: QIcon = QApplication.style().standardIcon(
                 QStyle.StandardPixmap.SP_MessageBoxInformation
             )
-            if icon.isNull():
-                return None
-            return icon
-        if role == Qt.ItemDataRole.TextAlignmentRole and column == _TOOL_SIZE_COLUMN:
-            return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            return None if icon.isNull() else icon
         return None
-
-    def flags(self, index: QModelIndex | QPersistentModelIndex) -> Qt.ItemFlag:
-        base = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-        if not 0 <= index.row() < len(self._tools):
-            return base
-        if index.column() == _TOOL_CHECK_COLUMN and self.is_deletable(self._tools[index.row()]):
-            return base | Qt.ItemFlag.ItemIsUserCheckable
-        return base
-
-    def setData(
-        self,
-        index: QModelIndex | QPersistentModelIndex,
-        value: object,
-        role: int = Qt.ItemDataRole.EditRole,
-    ) -> bool:
-        if role != Qt.ItemDataRole.CheckStateRole or index.column() != _TOOL_CHECK_COLUMN:
-            return False
-        if not 0 <= index.row() < len(self._tools):
-            return False
-        tool = self._tools[index.row()]
-        if not self.is_deletable(tool):
-            return False
-        checked = value in (Qt.CheckState.Checked, int(Qt.CheckState.Checked.value), True)
-        key = str(tool.path)
-        if checked:
-            self._selected.add(key)
-        else:
-            self._selected.discard(key)
-        self.dataChanged.emit(index, index)
-        self.selection_changed.emit()
-        return True
-
-    def headerData(
-        self,
-        section: int,
-        orientation: Qt.Orientation,
-        role: int = Qt.ItemDataRole.DisplayRole,
-    ) -> object:
-        if orientation != Qt.Orientation.Horizontal or role != Qt.ItemDataRole.DisplayRole:
-            return None
-        return _TOOL_HEADER_LABELS.get(section)
 
     def _display_text(self, tool: Tool, column: int) -> str:
         if column == _TOOL_NAME_COLUMN:
             return sanitize_display(tool.name)
-        if column == _TOOL_SIZE_COLUMN:
-            if str(tool.path) in self._pending:
-                return "Scanning..."
-            if str(tool.path) in self._failed:
-                return "Unavailable"
-            return format_size(tool.size_bytes)
         if column == _TOOL_STATUS_COLUMN:
             return _tool_status(tool, self.used, usage_known=self._usage_known)
         return ""
@@ -557,6 +356,7 @@ class MainWindow(QMainWindow):
         self._scan_total = 0
         self._scan_done = 0
         self._scan_errors: dict[str, str] = {}
+        self._cache_keys: dict[tuple[int, str], str] = {}
         self._sort_key = self._config.sort_column
         self._sort_descending = not self._config.sort_ascending
         self._libraries: list[Library] = []
@@ -943,44 +743,24 @@ class MainWindow(QMainWindow):
         self._update_tools_header_state()
 
     def _update_tools_header_state(self) -> None:
-        rows = self._tools_model.rows()
-        deletable = [tool for tool in rows if self._tools_model.is_deletable(tool)]
-        box = self._tools_header_checkbox
-        box.blockSignals(True)
-        if not deletable:
-            box.setCheckState(Qt.CheckState.Unchecked)
-        else:
-            selected = sum(1 for tool in deletable if self._tools_model.is_selected(tool))
-            if selected == 0:
-                box.setCheckState(Qt.CheckState.Unchecked)
-            elif selected == len(deletable):
-                box.setCheckState(Qt.CheckState.Checked)
-            else:
-                box.setCheckState(Qt.CheckState.PartiallyChecked)
-        box.blockSignals(False)
-        self._reposition_tools_header_checkbox()
+        sync_header_checkbox(
+            self._tools_header_checkbox,
+            self._tools_table.horizontalHeader(),
+            self._tools_model.header_check_state(),
+            _TOOL_CHECK_COLUMN,
+        )
 
     def _reposition_tools_header_checkbox(self) -> None:
         """Center the checkbox inside the tools header check section."""
-        header = self._tools_table.horizontalHeader()
-        hint = self._tools_header_checkbox.sizeHint()
-        section_width = max(header.sectionSize(_TOOL_CHECK_COLUMN), hint.width())
-        x = header.sectionPosition(_TOOL_CHECK_COLUMN)
-        y = max((header.height() - hint.height()) // 2, 0)
-        self._tools_header_checkbox.setGeometry(
-            x + (section_width - hint.width()) // 2,
-            y,
-            hint.width(),
-            hint.height(),
+        position_header_checkbox(
+            self._tools_header_checkbox, self._tools_table.horizontalHeader(), _TOOL_CHECK_COLUMN
         )
 
     def _on_tools_header_toggle(self) -> None:
-        rows = self._tools_model.rows()
-        deletable = [tool for tool in rows if self._tools_model.is_deletable(tool)]
-        if not deletable:
-            return
-        all_selected = all(self._tools_model.is_selected(tool) for tool in deletable)
-        self._tools_model.set_visible_deletable_selected(not all_selected)
+        self._tools_model.toggle_visible_deletable()
+        # Qt already flipped the box on click; resync it to the real
+        # selection, which also covers a click with no deletable rows.
+        self._update_tools_header_state()
 
     def _tools_status_summary_text(self) -> str:
         # Both filter buttons read Filters and expose the facet in the
@@ -1277,7 +1057,11 @@ class MainWindow(QMainWindow):
         results = list(self._deletion_results)
         for result in results:
             if result.status is DeletionStatus.DELETED:
-                invalidate(self._config.size_cache, result.prefix)
+                invalidate(
+                    self._config.size_cache,
+                    result.prefix,
+                    key=self._cache_key_for(result.prefix),
+                )
         save_config(self._config)
         self._deleting = False
         self._update_busy_state()
@@ -1366,6 +1150,9 @@ class MainWindow(QMainWindow):
         if epoch != self._epoch:
             return
         result, prefixes = payload
+        # Keys the worker resolved off-thread; anything missing (or a run
+        # fed without a worker) falls back to _cache_key_for's lazy path.
+        self._cache_keys = dict(getattr(worker, "cache_keys", None) or {})
         has_discovery_crash = any(
             err.path is None
             or err.kind is DiscoveryErrorKind.CRASH
@@ -1431,7 +1218,7 @@ class MainWindow(QMainWindow):
         store = Store()
         store.merge(prefixes)
         for prefix in prefixes:
-            cached = load_cached(self._config.size_cache, prefix)
+            cached = load_cached(self._config.size_cache, prefix, key=self._cache_key_for(prefix))
             if cached is not None:
                 store.upsert(cached)
         self._store = store
@@ -1456,7 +1243,7 @@ class MainWindow(QMainWindow):
             prefix
             for prefix in store.prefixes
             if prefix.scan_status is ScanStatus.NOT_SCANNED
-            and refresh_needed(self._config.size_cache, prefix)
+            and refresh_needed(self._config.size_cache, prefix, key=self._cache_key_for(prefix))
         ]
         if not pending:
             save_config(self._config)
@@ -1516,9 +1303,11 @@ class MainWindow(QMainWindow):
         assert isinstance(event.prefix, Prefix)
         self._store.upsert(event.prefix)
         if event.kind is ScanEventKind.COMPLETED:
-            record_scan(self._config.size_cache, event.prefix)
+            record_scan(
+                self._config.size_cache, event.prefix, key=self._cache_key_for(event.prefix)
+            )
         if event.kind is ScanEventKind.FAILED and event.error:
-            self._scan_errors[cache_key(event.prefix)] = event.error
+            self._scan_errors[self._cache_key_for(event.prefix)] = event.error
         self._scan_done += 1
         self._update_progress_text()
         if self._sort_key == "size":
@@ -1814,7 +1603,22 @@ class MainWindow(QMainWindow):
         self._status.showMessage(f"Scanning sizes... {self._scan_done}/{self._scan_total}")
 
     def _scan_error_for(self, prefix: Prefix) -> str | None:
-        return self._scan_errors.get(cache_key(prefix))
+        return self._scan_errors.get(self._cache_key_for(prefix))
+
+    def _cache_key_for(self, prefix: Prefix) -> str:
+        """Size-cache key of a prefix without touching the disk when known.
+
+        cache_key resolves the path, which is filesystem I/O; on a slow or
+        stalled mount that would stutter the window if done per event or
+        per tooltip. The discovery worker precomputes the keys off-thread;
+        a prefix it did not cover is resolved once here and remembered.
+        """
+        identity = prefix_key(prefix)
+        key = self._cache_keys.get(identity)
+        if key is None:
+            key = cache_key(prefix)
+            self._cache_keys[identity] = key
+        return key
 
     def _tool_for(self, prefix: Prefix) -> str | None:
         tool = tool_name_for(self._tool_mapping, prefix.app_id)

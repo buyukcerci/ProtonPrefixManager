@@ -15,19 +15,15 @@ from collections.abc import Callable, Sequence
 from dataclasses import replace
 
 from PySide6.QtCore import (
-    QAbstractTableModel,
-    QModelIndex,
-    QPersistentModelIndex,
     QRunnable,
     Qt,
     QThreadPool,
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QAction, QBrush, QPalette
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QCheckBox,
     QFrame,
     QHBoxLayout,
@@ -47,12 +43,16 @@ from core.deletion import DeleteMode, DeletionStatus, ShaderDeletionResult
 from core.discovery import Library
 from core.models import PrefixType, format_size
 from core.shaders import ShaderCache, shader_cache_key
+from ui.checkable_model import (
+    SizedCheckableModel,
+    position_header_checkbox,
+    sync_header_checkbox,
+)
 from ui.dialogs import confirm_final, confirm_selection, show_deletion_summary
 from ui.dialogs import tools_pending_note_for as pending_note_for
 from ui.sanitize import sanitize_display, sanitize_tooltip
 from ui.styles import (
     CHECK_WIDTH_PX,
-    HIGHLIGHT_DURATION_MS,
     MESSAGE_ICON_SIZE_PX,
     MESSAGE_LAYOUT_SPACING_PX,
     MESSAGE_PAGE_MARGIN_PX,
@@ -102,8 +102,6 @@ RECOMPILE_NOTE = (
 DELETE_START_FAILED_TEXT = "Could not start shader cache deletion."
 DELETE_START_FAILED_TIMEOUT_MS = 5000
 
-_ROOT_INDEX = QModelIndex()
-
 
 def matches_search(cache: ShaderCache, text: str) -> bool:
     """Case-insensitive match on name, or on AppID digits."""
@@ -113,157 +111,41 @@ def matches_search(cache: ShaderCache, text: str) -> bool:
     return needle in cache.name.casefold() or needle in str(cache.app_id)
 
 
-class ShaderTableModel(QAbstractTableModel):
-    """Shader cache rows; every row is deletable since Steam can rebuild it."""
+class ShaderTableModel(SizedCheckableModel[ShaderCache]):
+    """Shader cache rows; every row is deletable since Steam can rebuild it.
 
-    selection_changed = Signal()
+    Selection, size states and the row highlight come from
+    SizedCheckableModel; rows are keyed by shader_cache_key, which is the
+    same str(path) the base uses.
+    """
 
-    def __init__(self) -> None:
-        super().__init__()
-        self._rows: list[ShaderCache] = []
-        self._pending: set[str] = set()
-        self._failed: set[str] = set()
-        self._selected: set[str] = set()
-        self._highlighted: str | None = None
-        self._highlight_timer = QTimer(self)
-        self._highlight_timer.setSingleShot(True)
-        self._highlight_timer.timeout.connect(self.clear_highlight)
-
-    # --- state --------------------------------------------------------------
+    check_column = CHECK_COLUMN
+    size_column = SIZE_COLUMN
+    column_count = _COLUMN_COUNT
+    header_labels = _HEADER_LABELS
 
     def reset_items(self, caches: Sequence[ShaderCache]) -> None:
         """New discovery results: every row starts pending, nothing selected."""
-        self.beginResetModel()
-        self._rows = list(caches)
-        self._pending = {shader_cache_key(cache) for cache in caches}
-        self._failed.clear()
-        self._selected.clear()
         self._highlighted = None
         self._highlight_timer.stop()
-        self.endResetModel()
-        self.selection_changed.emit()
-
-    def set_visible(self, caches: Sequence[ShaderCache]) -> None:
-        """Re-slice visible rows, dropping selections the filter hides."""
         self.beginResetModel()
-        self._rows = list(caches)
-        visible = {shader_cache_key(cache) for cache in caches}
-        self._selected &= visible
+        self._reset_rows(caches)
         self.endResetModel()
         self.selection_changed.emit()
-
-    def set_size(self, key: str, size_bytes: int, failed: bool) -> None:
-        self._pending.discard(key)
-        if failed:
-            self._failed.add(key)
-        else:
-            self._failed.discard(key)
-        for row, cache in enumerate(self._rows):
-            if shader_cache_key(cache) == key:
-                self._rows[row] = replace(cache, size_bytes=size_bytes)
-                self.dataChanged.emit(self.index(row, SIZE_COLUMN), self.index(row, SIZE_COLUMN))
-                return
-
-    def mark_pending_unavailable(self) -> None:
-        """Rows the size worker never reported read Unavailable, not 0 B."""
-        if not self._pending:
-            return
-        self._failed |= self._pending
-        self._pending.clear()
-        if self._rows:
-            last = len(self._rows) - 1
-            self.dataChanged.emit(self.index(0, SIZE_COLUMN), self.index(last, SIZE_COLUMN))
-
-    @property
-    def pending(self) -> set[str]:
-        return set(self._pending)
-
-    @property
-    def failed(self) -> set[str]:
-        return set(self._failed)
-
-    def rows(self) -> list[ShaderCache]:
-        return list(self._rows)
 
     def selected_caches(self) -> list[ShaderCache]:
-        return [cache for cache in self._rows if shader_cache_key(cache) in self._selected]
-
-    def is_selected(self, cache: ShaderCache) -> bool:
-        return shader_cache_key(cache) in self._selected
+        return self.selected_items()
 
     def set_all_selected(self, selected: bool) -> None:
-        if selected:
-            self._selected = {shader_cache_key(cache) for cache in self._rows}
-        else:
-            self._selected.clear()
-        if self._rows:
-            last = len(self._rows) - 1
-            self.dataChanged.emit(self.index(0, CHECK_COLUMN), self.index(last, CHECK_COLUMN))
-        self.selection_changed.emit()
+        self.set_visible_deletable_selected(selected)
 
-    def highlight_row(self, cache: ShaderCache) -> None:
-        previous = self._highlighted
-        self._highlighted = shader_cache_key(cache)
-        if previous is not None and previous != self._highlighted:
-            self._emit_row_changed(previous)
-        self._emit_row_changed(self._highlighted)
-        self._highlight_timer.start(HIGHLIGHT_DURATION_MS)
-
-    def clear_highlight(self) -> None:
-        key = self._highlighted
-        self._highlighted = None
-        if key is not None:
-            self._emit_row_changed(key)
-
-    def highlighted_key(self) -> str | None:
-        return self._highlighted
-
-    def _emit_row_changed(self, key: str) -> None:
-        for row, cache in enumerate(self._rows):
-            if shader_cache_key(cache) == key:
-                self.dataChanged.emit(self.index(row, 0), self.index(row, _COLUMN_COUNT - 1))
-                return
-
-    # --- Qt model API -------------------------------------------------------
-
-    def rowCount(self, parent: QModelIndex | QPersistentModelIndex = _ROOT_INDEX) -> int:  # noqa: N802
-        return 0 if parent.isValid() else len(self._rows)
-
-    def columnCount(self, parent: QModelIndex | QPersistentModelIndex = _ROOT_INDEX) -> int:  # noqa: N802
-        return _COLUMN_COUNT
-
-    def data(
-        self,
-        index: QModelIndex | QPersistentModelIndex,
-        role: int = Qt.ItemDataRole.DisplayRole,
-    ) -> object:
-        if not index.isValid() or not 0 <= index.row() < len(self._rows):
-            return None
-        cache = self._rows[index.row()]
-        column = index.column()
-        key = shader_cache_key(cache)
-        if key == self._highlighted and role in (
-            Qt.ItemDataRole.BackgroundRole,
-            Qt.ItemDataRole.ForegroundRole,
-        ):
-            palette = QApplication.palette()
-            color_role = (
-                QPalette.ColorRole.Highlight
-                if role == Qt.ItemDataRole.BackgroundRole
-                else QPalette.ColorRole.HighlightedText
-            )
-            return QBrush(palette.color(color_role))
-        if role == Qt.ItemDataRole.DisplayRole:
-            return self._display_text(cache, column)
-        if role == Qt.ItemDataRole.CheckStateRole and column == CHECK_COLUMN:
-            state = Qt.CheckState.Checked if key in self._selected else Qt.CheckState.Unchecked
-            return int(state.value)
+    def _extra_data(self, cache: ShaderCache, column: int, role: int) -> object:
         if role == Qt.ItemDataRole.ToolTipRole and column == NAME_COLUMN:
             lines = [sanitize_display(cache.name, limit=None), str(cache.path)]
             if cache.is_orphan:
                 lines.append("No installed game or shortcut uses this AppID.")
             return sanitize_tooltip("\n".join(lines))
-        if role == Qt.ItemDataRole.TextAlignmentRole and column in (SIZE_COLUMN, APP_ID_COLUMN):
+        if role == Qt.ItemDataRole.TextAlignmentRole and column == APP_ID_COLUMN:
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         return None
 
@@ -272,51 +154,9 @@ class ShaderTableModel(QAbstractTableModel):
             return sanitize_display(cache.name)
         if column == APP_ID_COLUMN:
             return str(cache.app_id)
-        if column == SIZE_COLUMN:
-            key = shader_cache_key(cache)
-            if key in self._pending:
-                return "Scanning..."
-            if key in self._failed:
-                return "Unavailable"
-            return format_size(cache.size_bytes)
         if column == STATUS_COLUMN:
             return STATUS_LABELS[cache.cache_type]
         return ""
-
-    def flags(self, index: QModelIndex | QPersistentModelIndex) -> Qt.ItemFlag:
-        base = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-        if index.column() == CHECK_COLUMN and 0 <= index.row() < len(self._rows):
-            return base | Qt.ItemFlag.ItemIsUserCheckable
-        return base
-
-    def setData(  # noqa: N802
-        self,
-        index: QModelIndex | QPersistentModelIndex,
-        value: object,
-        role: int = Qt.ItemDataRole.EditRole,
-    ) -> bool:
-        if role != Qt.ItemDataRole.CheckStateRole or index.column() != CHECK_COLUMN:
-            return False
-        if not 0 <= index.row() < len(self._rows):
-            return False
-        key = shader_cache_key(self._rows[index.row()])
-        if value in (Qt.CheckState.Checked, int(Qt.CheckState.Checked.value), True):
-            self._selected.add(key)
-        else:
-            self._selected.discard(key)
-        self.dataChanged.emit(index, index)
-        self.selection_changed.emit()
-        return True
-
-    def headerData(  # noqa: N802
-        self,
-        section: int,
-        orientation: Qt.Orientation,
-        role: int = Qt.ItemDataRole.DisplayRole,
-    ) -> object:
-        if orientation != Qt.Orientation.Horizontal or role != Qt.ItemDataRole.DisplayRole:
-            return None
-        return _HEADER_LABELS.get(section)
 
 
 class ShadersPage(QWidget):
@@ -354,6 +194,10 @@ class ShadersPage(QWidget):
         self._size_refresh_timer.setSingleShot(True)
         self._size_refresh_timer.setInterval(SHADERS_SIZE_DEBOUNCE_MS)
         self._size_refresh_timer.timeout.connect(self._flush_size_refresh)
+        self._pending_focus_key: str | None = None
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.setSingleShot(True)
+        self._scroll_timer.timeout.connect(self._scroll_to_pending_focus)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -613,9 +457,23 @@ class ShadersPage(QWidget):
         else:
             self._apply_filter()
         key = shader_cache_key(cache)
-        for row, visible in enumerate(self.model.rows()):
+        for visible in self.model.rows():
             if shader_cache_key(visible) == key:
                 self.model.highlight_row(visible)
+                # The tab may have just been switched to and not laid out
+                # yet, so the scroll waits one event-loop turn to centre
+                # the row; the row is re-resolved from the key at fire time.
+                self._pending_focus_key = key
+                self._scroll_timer.start(0)
+                return
+
+    def _scroll_to_pending_focus(self) -> None:
+        key = self._pending_focus_key
+        self._pending_focus_key = None
+        if key is None:
+            return
+        for row, visible in enumerate(self.model.rows()):
+            if shader_cache_key(visible) == key:
                 self.table.scrollTo(
                     self.model.index(row, NAME_COLUMN),
                     QAbstractItemView.ScrollHint.PositionAtCenter,
@@ -629,33 +487,20 @@ class ShadersPage(QWidget):
         self._update_header_checkbox()
 
     def _update_header_checkbox(self) -> None:
-        rows = self.model.rows()
-        selected = sum(1 for cache in rows if self.model.is_selected(cache))
-        box = self.header_checkbox
-        box.blockSignals(True)
-        if not rows or selected == 0:
-            box.setCheckState(Qt.CheckState.Unchecked)
-        elif selected == len(rows):
-            box.setCheckState(Qt.CheckState.Checked)
-        else:
-            box.setCheckState(Qt.CheckState.PartiallyChecked)
-        box.blockSignals(False)
-        self._reposition_header_checkbox()
+        sync_header_checkbox(
+            self.header_checkbox,
+            self.table.horizontalHeader(),
+            self.model.header_check_state(),
+            CHECK_COLUMN,
+        )
 
     def _reposition_header_checkbox(self) -> None:
-        header = self.table.horizontalHeader()
-        hint = self.header_checkbox.sizeHint()
-        width = max(header.sectionSize(CHECK_COLUMN), hint.width())
-        x = header.sectionPosition(CHECK_COLUMN) + (width - hint.width()) // 2
-        y = max((header.height() - hint.height()) // 2, 0)
-        self.header_checkbox.setGeometry(x, y, hint.width(), hint.height())
+        position_header_checkbox(self.header_checkbox, self.table.horizontalHeader(), CHECK_COLUMN)
 
     def _on_header_toggle(self) -> None:
         # Qt has already cycled the tristate box by the time clicked fires,
         # so its state is resynced from the model even when nothing changed.
-        rows = self.model.rows()
-        if rows:
-            self.model.set_all_selected(not all(self.model.is_selected(c) for c in rows))
+        self.model.toggle_visible_deletable()
         self._update_header_checkbox()
 
     def _update_summary(self) -> None:
@@ -747,4 +592,6 @@ class ShadersPage(QWidget):
         """Window is closing: drop timers so nothing fires after teardown."""
         self._search_timer.stop()
         self._size_refresh_timer.stop()
+        self._scroll_timer.stop()
+        self._pending_focus_key = None
         self.model.clear_highlight()

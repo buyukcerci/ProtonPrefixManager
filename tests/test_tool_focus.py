@@ -99,3 +99,17 @@ def test_highlight_switch_clears_previous_row(qtbot) -> None:
     # Both rows reported the state change, not only the new target.
     assert (0, 0) in emitted
     assert (1, 1) in emitted
+
+
+def test_tools_header_checkbox_resyncs_without_deletable_rows(qtbot, tmp_path, monkeypatch) -> None:
+    from PySide6.QtCore import Qt
+
+    from ui.main_window import MainWindow
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    # No rows at all: Qt flips the box on click, the handler must flip it back.
+    window._tools_header_checkbox.click()
+    assert window._tools_header_checkbox.checkState() == Qt.CheckState.Unchecked

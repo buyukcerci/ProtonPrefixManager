@@ -396,7 +396,22 @@ def delete_tools(
     *,
     libraries: Sequence[Library] = (),
 ) -> list[ToolDeletionResult]:
-    """Delete each validated tool, returning one result per unique target.
+    """List form of iter_delete_tools; see there for the rules."""
+    return list(iter_delete_tools(tools, roots, used_paths, mode, libraries=libraries))
+
+
+def iter_delete_tools(
+    tools: Sequence[Tool],
+    roots: Sequence[SteamRoot | Path],
+    used_paths: set[str],
+    mode: DeleteMode = DeleteMode.TRASH,
+    *,
+    libraries: Sequence[Library] = (),
+) -> Iterator[ToolDeletionResult]:
+    """Delete each validated tool, yielding one result per unique target.
+
+    Each result is yielded as soon as its target is handled, so a caller
+    that sees an exception knows exactly which targets were already done.
 
     Inputs are grouped by resolved target path and results keep
     first-seen order. When several records resolve to one target the
@@ -441,29 +456,24 @@ def delete_tools(
             grouped[key] = []
             order.append(key)
         grouped[key].append((tool, target))
-    results: list[ToolDeletionResult] = []
     for key in order:
         aliases = grouped[key]
         first, target = aliases[0]
         structurally_read_only = str(target.parent) in readonly_parents
         if structurally_read_only or any(alias.read_only for alias, _ in aliases):
-            results.append(
-                ToolDeletionResult(
-                    tool=first,
-                    mode=mode,
-                    status=DeletionStatus.REJECTED,
-                    reject_reason=RejectReason.READ_ONLY,
-                )
+            yield ToolDeletionResult(
+                tool=first,
+                mode=mode,
+                status=DeletionStatus.REJECTED,
+                reject_reason=RejectReason.READ_ONLY,
             )
             continue
         if str(target) in used:
-            results.append(
-                ToolDeletionResult(
-                    tool=first,
-                    mode=mode,
-                    status=DeletionStatus.REJECTED,
-                    reject_reason=RejectReason.IN_USE,
-                )
+            yield ToolDeletionResult(
+                tool=first,
+                mode=mode,
+                status=DeletionStatus.REJECTED,
+                reject_reason=RejectReason.IN_USE,
             )
             continue
         if any(
@@ -471,38 +481,31 @@ def delete_tools(
             for alias, _ in aliases
         ):
             reason = RejectReason.MISSING if not target.is_dir() else RejectReason.IDENTITY_MISMATCH
-            results.append(
-                ToolDeletionResult(
-                    tool=first,
-                    mode=mode,
-                    status=DeletionStatus.REJECTED,
-                    reject_reason=reason,
-                )
+            yield ToolDeletionResult(
+                tool=first,
+                mode=mode,
+                status=DeletionStatus.REJECTED,
+                reject_reason=reason,
             )
             continue
         expanded_tools = [alias.path.expanduser() for alias, _ in aliases]
         if any(raw.is_symlink() or _unresolved_parent_has_symlink(raw) for raw in expanded_tools):
-            results.append(
-                ToolDeletionResult(
-                    tool=first,
-                    mode=mode,
-                    status=DeletionStatus.REJECTED,
-                    reject_reason=RejectReason.SYMLINK,
-                )
+            yield ToolDeletionResult(
+                tool=first,
+                mode=mode,
+                status=DeletionStatus.REJECTED,
+                reject_reason=RejectReason.SYMLINK,
             )
             continue
         if any(target.name != raw.name for raw in expanded_tools):
-            results.append(
-                ToolDeletionResult(
-                    tool=first,
-                    mode=mode,
-                    status=DeletionStatus.REJECTED,
-                    reject_reason=RejectReason.NAME_MISMATCH,
-                )
+            yield ToolDeletionResult(
+                tool=first,
+                mode=mode,
+                status=DeletionStatus.REJECTED,
+                reject_reason=RejectReason.NAME_MISMATCH,
             )
             continue
-        results.append(_delete_one_tool(first, target, mode, toolsdirs, used, readonly_parents))
-    return results
+        yield _delete_one_tool(first, target, mode, toolsdirs, used, readonly_parents)
 
 
 def _current_toolsdirs(roots: Sequence[SteamRoot | Path]) -> list[Path]:

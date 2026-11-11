@@ -474,12 +474,12 @@ def deletion_setup(qtbot, isolated_env: Path, monkeypatch: pytest.MonkeyPatch):
     )
     invalidated: list[Path] = []
 
-    def recording_invalidate(cache, target):
+    def recording_invalidate(cache, target, *, key=None):
         from core.scanner import invalidate as real_invalidate
 
         path = target.path if hasattr(target, "path") else target
         invalidated.append(Path(str(path)))
-        real_invalidate(cache, target)
+        real_invalidate(cache, target, key=key)
 
     monkeypatch.setattr("ui.main_window.invalidate", recording_invalidate)
     return (
@@ -806,10 +806,9 @@ def test_tools_overview_refresh_is_debounced(qtbot, isolated_env: Path) -> None:
 def test_tool_highlight_expires_without_manual_clear(
     qtbot, isolated_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import ui.main_window as main_window_module
     from ui.main_window import ToolTableModel
 
-    monkeypatch.setattr(main_window_module, "HIGHLIGHT_DURATION_MS", 20)
+    monkeypatch.setattr("ui.checkable_model.HIGHLIGHT_DURATION_MS", 20)
     model = ToolTableModel()
     tool = Tool(
         name="Build",

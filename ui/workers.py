@@ -22,9 +22,9 @@ from core.deletion import (
     RejectReason,
     ShaderDeletionResult,
     ToolDeletionResult,
-    delete_tools,
     iter_delete_prefixes,
     iter_delete_shader_caches,
+    iter_delete_tools,
 )
 from core.discovery import (
     DiscoveryError,
@@ -35,9 +35,9 @@ from core.discovery import (
     discover,
 )
 from core.enumeration import enumerate_from_discovery
-from core.models import Prefix
+from core.models import Prefix, prefix_key
 from core.opener import OpenResult, OpenStatus, open_folder
-from core.scanner import scan_prefix, scan_prefixes
+from core.scanner import cache_key, scan_prefix, scan_prefixes
 from core.shaders import ShaderCache, enumerate_shader_caches
 from core.toolmap import contributing_roots, load_tool_mapping
 from core.tools import Tool, used_by
@@ -55,12 +55,19 @@ class DiscoverySignals(QObject):
 
 
 class DiscoveryWorker(QRunnable):
-    """Runs discovery plus enumeration and reports the combined payload."""
+    """Runs discovery plus enumeration and reports the combined payload.
+
+    cache_keys maps each enumerated prefix's prefix_key to its size-cache
+    key. Building a cache key resolves the path on disk, so it is done
+    here, off the UI thread; the window reads the mapping from the worker
+    once finished has fired.
+    """
 
     def __init__(self, custom_roots: Sequence[str], epoch: int) -> None:
         super().__init__()
         self._custom_roots = list(custom_roots)
         self.epoch = epoch
+        self.cache_keys: dict[tuple[int, str], str] = {}
         self.signals = DiscoverySignals()
 
     def run(self) -> None:
@@ -69,6 +76,7 @@ class DiscoveryWorker(QRunnable):
         try:
             result = discover(custom_roots=self._custom_roots)
             prefixes = enumerate_from_discovery(result)
+            self.cache_keys = {prefix_key(prefix): cache_key(prefix) for prefix in prefixes}
         except Exception as exc:
             _logger.error("discovery worker failed: %s", exc)
             kind = (
@@ -365,7 +373,7 @@ class ToolDeletionSignals(QObject):
 
 
 class ToolDeletionWorker(QRunnable):
-    """Runs delete_tools and streams one event per target.
+    """Runs iter_delete_tools and streams one event per target.
 
     The usage mapping is reloaded here at run time instead of trusting a
     used set captured when the click handler ran, so a tool selected by a
@@ -378,6 +386,9 @@ class ToolDeletionWorker(QRunnable):
     always emits, including when the batch raises unexpectedly; each
     target not yet reported is then reported as a failed result so the
     window never stays in the deleting state and no target is double-listed.
+    Results stream as each target is handled, so tools removed before the
+    failure keep their DELETED result, and aliases of a reported target are
+    not reported again.
     """
 
     def __init__(
@@ -405,7 +416,7 @@ class ToolDeletionWorker(QRunnable):
             if scan_contributing_roots is not None
             else None
         )
-        self._emitted_paths: set[Path] = set()
+        self._emitted_targets: set[str] = set()
         self.signals = ToolDeletionSignals()
 
     def run(self) -> None:
@@ -414,7 +425,7 @@ class ToolDeletionWorker(QRunnable):
         except Exception as exc:
             _logger.error("tool deletion batch failed: %s", exc)
             for tool in self._tools:
-                if tool.path in self._emitted_paths:
+                if _target_key(tool) in self._emitted_targets:
                     continue
                 self.signals.result_ready.emit(
                     ToolDeletionResult(
@@ -426,7 +437,7 @@ class ToolDeletionWorker(QRunnable):
                     ),
                     self.epoch,
                 )
-                self._emitted_paths.add(tool.path)
+                self._emitted_targets.add(_target_key(tool))
         finally:
             self.signals.finished.emit(self.epoch)
 
@@ -443,7 +454,7 @@ class ToolDeletionWorker(QRunnable):
                 shrunk = True
         if mapping_errors or shrunk:
             for tool in self._tools:
-                if tool.path in self._emitted_paths:
+                if _target_key(tool) in self._emitted_targets:
                     continue
                 self.signals.result_ready.emit(
                     ToolDeletionResult(
@@ -454,11 +465,11 @@ class ToolDeletionWorker(QRunnable):
                     ),
                     self.epoch,
                 )
-                self._emitted_paths.add(tool.path)
+                self._emitted_targets.add(_target_key(tool))
             return
         used_paths = set(used_by(self._tools, mapping))
-        for result in delete_tools(
+        for result in iter_delete_tools(
             self._tools, self._roots, used_paths, self._mode, libraries=self._libraries
         ):
             self.signals.result_ready.emit(result, self.epoch)
-            self._emitted_paths.add(result.tool.path)
+            self._emitted_targets.add(_target_key(result.tool))

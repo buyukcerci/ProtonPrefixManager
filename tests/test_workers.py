@@ -383,7 +383,7 @@ def test_tool_deletion_worker_reports_unexpected_failure(
     def broken_batch(*args: object, **kwargs: object) -> list[object]:
         raise RuntimeError("unexpected backend crash")
 
-    monkeypatch.setattr(workers_module, "delete_tools", broken_batch)
+    monkeypatch.setattr(workers_module, "iter_delete_tools", broken_batch)
     worker = ToolDeletionWorker([tool], [root], DeleteMode.TRASH, epoch=8)
     events: list[tuple[object, int]] = []
     finished: list[int] = []
@@ -524,7 +524,7 @@ def test_tool_deletion_worker_unexpected_failure_avoids_duplicate_emission(
         yield ToolDeletionResult(tool=tool1, mode=DeleteMode.TRASH, status=DeletionStatus.DELETED)
         raise RuntimeError("crash after first tool")
 
-    monkeypatch.setattr(workers_module, "delete_tools", partially_failing_delete)
+    monkeypatch.setattr(workers_module, "iter_delete_tools", partially_failing_delete)
     worker = ToolDeletionWorker([tool1, tool2], [root], DeleteMode.TRASH, epoch=11)
     events: list[tuple[object, int]] = []
     finished: list[int] = []

@@ -1224,3 +1224,19 @@ def test_custom_root_aliasing_managed_common_dir_preserves_read_only(
     assert len(tools) == 1
     assert tools[0].read_only is True
     assert tools[0].name_unverified is True
+
+
+def test_iter_delete_tools_yields_before_later_targets_run(
+    tmp_path: Path, trash_calls: list[Path]
+) -> None:
+    from core.deletion import iter_delete_tools
+
+    root = _make_root(tmp_path)
+    _write_tool(root.path / "compatibilitytools.d", "BuildA", vdf_text=None)
+    _write_tool(root.path / "compatibilitytools.d", "BuildB", vdf_text=None)
+    tools = _enumerate([root], [])
+    results = iter_delete_tools(tools, [root], used_paths=set())
+    assert next(results).status is DeletionStatus.DELETED
+    assert len(trash_calls) == 1
+    assert next(results).status is DeletionStatus.DELETED
+    assert len(trash_calls) == 2
