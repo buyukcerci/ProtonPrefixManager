@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Collection, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from PySide6.QtCore import QObject, QRunnable, Signal
 
@@ -20,9 +20,11 @@ from core.deletion import (
     DeletionStatus,
     FailureKind,
     RejectReason,
+    ShaderDeletionResult,
     ToolDeletionResult,
     delete_tools,
     iter_delete_prefixes,
+    iter_delete_shader_caches,
 )
 from core.discovery import (
     DiscoveryError,
@@ -36,10 +38,16 @@ from core.enumeration import enumerate_from_discovery
 from core.models import Prefix
 from core.opener import OpenResult, OpenStatus, open_folder
 from core.scanner import scan_prefix, scan_prefixes
+from core.shaders import ShaderCache
 from core.toolmap import contributing_roots, load_tool_mapping
 from core.tools import Tool, used_by
 
 _logger = logging.getLogger(__name__)
+
+
+class _HasPath(Protocol):
+    @property
+    def path(self) -> Path: ...
 
 
 class DiscoverySignals(QObject):
@@ -169,12 +177,12 @@ class DeletionWorker(QRunnable):
             self.signals.finished.emit(self.epoch)
 
 
-def _target_key(prefix: Prefix) -> str:
-    """Resolved target path, the unit delete_prefixes groups and reports by."""
+def _target_key(item: _HasPath) -> str:
+    """Resolved target path, the unit the delete functions group and report by."""
     try:
-        return str(prefix.path.expanduser().resolve(strict=False))
+        return str(item.path.expanduser().resolve(strict=False))
     except (OSError, RuntimeError):
-        return str(prefix.path)
+        return str(item.path)
 
 
 class OpenFolderSignals(QObject):
@@ -210,11 +218,14 @@ class ToolSizeSignals(QObject):
 
 
 class ToolSizeWorker(QRunnable):
-    """Walks each tool directory and reports one event per tool."""
+    """Walks each item's directory and reports one (path, size, error) event per item.
+
+    Items only need a path, so tools and shader caches share this worker.
+    """
 
     def __init__(
         self,
-        tools: Sequence[Tool],
+        tools: Sequence[_HasPath],
         epoch: int,
         is_stale: Callable[[], bool] | None = None,
     ) -> None:
@@ -239,6 +250,9 @@ class ToolSizeWorker(QRunnable):
             _logger.error("tool size worker failed: %s", exc)
         finally:
             self.signals.finished.emit(self.epoch)
+
+
+SizeWorker = ToolSizeWorker
 
 
 class ToolDeletionSignals(QObject):
@@ -344,3 +358,52 @@ class ToolDeletionWorker(QRunnable):
         ):
             self.signals.result_ready.emit(result, self.epoch)
             self._emitted_paths.add(result.tool.path)
+
+
+class ShaderDeletionWorker(QRunnable):
+    """Runs iter_delete_shader_caches and streams one event per target.
+
+    Same contract as DeletionWorker: finished always emits, and when the
+    batch raises partway only targets not reported yet get a synthetic
+    FAILED result, so caches already removed keep their DELETED result.
+    """
+
+    def __init__(
+        self,
+        caches: Sequence[ShaderCache],
+        libraries: Sequence[Library],
+        mode: DeleteMode,
+        epoch: int,
+    ) -> None:
+        super().__init__()
+        self._caches = list(caches)
+        self._libraries = list(libraries)
+        self._mode = mode
+        self.epoch = epoch
+        self._emitted_targets: set[str] = set()
+        self.signals = DeletionSignals()
+
+    def run(self) -> None:
+        try:
+            for result in iter_delete_shader_caches(self._caches, self._libraries, self._mode):
+                self._emitted_targets.add(_target_key(result.cache))
+                self.signals.result_ready.emit(result, self.epoch)
+        except Exception as exc:
+            _logger.error("shader cache deletion worker failed: %s", exc)
+            for cache in self._caches:
+                key = _target_key(cache)
+                if key in self._emitted_targets:
+                    continue
+                self._emitted_targets.add(key)
+                self.signals.result_ready.emit(
+                    ShaderDeletionResult(
+                        cache=cache,
+                        mode=self._mode,
+                        status=DeletionStatus.FAILED,
+                        failure_kind=FailureKind.OS,
+                        error=str(exc),
+                    ),
+                    self.epoch,
+                )
+        finally:
+            self.signals.finished.emit(self.epoch)

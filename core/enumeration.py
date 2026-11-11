@@ -13,6 +13,7 @@ import os
 import re
 import stat
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import vdf
@@ -74,18 +75,24 @@ def is_real_dir(path: Path) -> bool:
         return False
 
 
-def library_compatdata_dir(library: Library) -> Path | None:
-    """Lexical steamapps/compatdata path of a library, or None when unusable.
+def library_steamapps_subdir(library: Library, name: str) -> Path | None:
+    """Lexical steamapps/<name> path of a library, or None when unusable.
 
-    Both steamapps and compatdata must be real directories; a symlink at
-    either level is refused rather than followed, so the library cannot
-    relocate its prefixes (and the deletion boundary) elsewhere.
+    Both steamapps and the subdirectory must be real directories; a
+    symlink at either level is refused rather than followed, so the
+    library cannot relocate its contents (and the deletion boundary)
+    elsewhere.
     """
     steamapps = library.path / STEAMAPPS_DIR
-    compatdata = steamapps / COMPATDATA_DIR
-    if is_real_dir(steamapps) and is_real_dir(compatdata):
-        return compatdata
+    subdir = steamapps / name
+    if is_real_dir(steamapps) and is_real_dir(subdir):
+        return subdir
     return None
+
+
+def library_compatdata_dir(library: Library) -> Path | None:
+    """Lexical steamapps/compatdata path of a library, or None when unusable."""
+    return library_steamapps_subdir(library, COMPATDATA_DIR)
 
 
 def symlinked_compatdata_paths(libraries: Sequence[Library]) -> list[Path]:
@@ -106,8 +113,13 @@ def symlinked_compatdata_paths(libraries: Sequence[Library]) -> list[Path]:
 
 def compatdata_symlink(library_path: Path) -> Path | None:
     """The steamapps or compatdata path under library_path that is a symlink, if any."""
+    return steamapps_subdir_symlink(library_path, COMPATDATA_DIR)
+
+
+def steamapps_subdir_symlink(library_path: Path, name: str) -> Path | None:
+    """The steamapps or steamapps/<name> path under library_path that is a symlink."""
     steamapps = library_path / STEAMAPPS_DIR
-    for path in (steamapps, steamapps / COMPATDATA_DIR):
+    for path in (steamapps, steamapps / name):
         try:
             if stat.S_ISLNK(os.stat(path, follow_symlinks=False).st_mode):
                 return path
@@ -165,32 +177,55 @@ def enumerate_prefixes(
     return prefixes
 
 
+@dataclass(frozen=True, slots=True)
+class AppIdentity:
+    """Display name and classification of one AppID within a library."""
+
+    name: str
+    app_type: PrefixType
+    runtime_component: bool
+
+
+def identify_app(app_id: int, library: Library, shortcuts: Mapping[int, str]) -> AppIdentity:
+    """Resolve an AppID's name and type: manifest > shortcut > unknown.
+
+    Shared by prefix and shader cache enumeration so both classify the
+    same AppID the same way.
+    """
+    manifest_name = _manifest_name(library.path, app_id)
+    shortcut_name = shortcuts.get(app_id)
+    resolved_name = manifest_name if manifest_name is not None else shortcut_name
+    runtime_component = is_runtime_component(app_id, resolved_name)
+    if manifest_name is not None:
+        return AppIdentity(manifest_name, PrefixType.STEAM, runtime_component)
+    if shortcut_name is not None:
+        return AppIdentity(shortcut_name, PrefixType.NON_STEAM, runtime_component)
+    return AppIdentity(
+        UNKNOWN_NAME_TEMPLATE.format(app_id=app_id), PrefixType.ORPHANED, runtime_component
+    )
+
+
+def load_shortcuts(roots: Sequence[SteamRoot]) -> dict[int, str]:
+    """Merged shortcut names from every root; see _load_shortcuts."""
+    return _load_shortcuts(roots)
+
+
 def _classify(
     app_id: int,
     path: Path,
     library: Library,
     shortcuts: Mapping[int, str],
 ) -> Prefix:
-    manifest_name = _manifest_name(library.path, app_id)
-    shortcut_name = shortcuts.get(app_id)
-    resolved_name = manifest_name if manifest_name is not None else shortcut_name
-    runtime_component = is_runtime_component(app_id, resolved_name)
-    if manifest_name is not None:
-        prefix_type, name = PrefixType.STEAM, manifest_name
-    elif shortcut_name is not None:
-        prefix_type, name = PrefixType.NON_STEAM, shortcut_name
-    else:
-        prefix_type = PrefixType.ORPHANED
-        name = UNKNOWN_NAME_TEMPLATE.format(app_id=app_id)
+    identity = identify_app(app_id, library, shortcuts)
     return Prefix(
         app_id=app_id,
-        name=name,
-        prefix_type=prefix_type,
+        name=identity.name,
+        prefix_type=identity.app_type,
         path=path,
         library=str(library.path),
         size_bytes=0,
         scan_status=ScanStatus.NOT_SCANNED,
-        is_runtime_component=runtime_component,
+        is_runtime_component=identity.runtime_component,
     )
 
 

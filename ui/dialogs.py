@@ -23,6 +23,7 @@ from core.deletion import (
     DeleteMode,
     DeletionResult,
     DeletionStatus,
+    ShaderDeletionResult,
     ToolDeletionResult,
 )
 from core.models import Prefix, ScanStatus
@@ -126,7 +127,18 @@ def confirm_final(
     return _radio_mode(trash_radio, permanent_radio)
 
 
-def summary_body(results: Sequence[DeletionResult | ToolDeletionResult]) -> str:
+AnyDeletionResult = DeletionResult | ToolDeletionResult | ShaderDeletionResult
+
+
+def _result_header(result: AnyDeletionResult) -> str:
+    if isinstance(result, DeletionResult):
+        return sanitize_display(f"[{result.prefix.app_id}] {result.prefix.name}")
+    if isinstance(result, ShaderDeletionResult):
+        return sanitize_display(f"[{result.cache.app_id}] {result.cache.name} (shader cache)")
+    return sanitize_display(result.tool.name)
+
+
+def summary_body(results: Sequence[AnyDeletionResult]) -> str:
     """Shared body text for show_deletion_summary, exposed for content tests."""
     deleted = sum(1 for r in results if r.status is DeletionStatus.DELETED)
     problems = [r for r in results if r.status is not DeletionStatus.DELETED]
@@ -137,11 +149,7 @@ def summary_body(results: Sequence[DeletionResult | ToolDeletionResult]) -> str:
         lines.append("")
         lines.append("Targets that were not removed:")
         for problem in problems:
-            target = problem.prefix if isinstance(problem, DeletionResult) else problem.tool
-            if isinstance(target, Prefix):
-                header = sanitize_display(f"[{target.app_id}] {target.name}")
-            else:
-                header = sanitize_display(target.name)
+            header = _result_header(problem)
             if problem.status is DeletionStatus.REJECTED:
                 reason = problem.reject_reason.value if problem.reject_reason else "rejected"
                 lines.append(f"  {header}: rejected ({reason})")
@@ -152,9 +160,7 @@ def summary_body(results: Sequence[DeletionResult | ToolDeletionResult]) -> str:
     return "\n".join(lines)
 
 
-def show_deletion_summary(
-    parent: QWidget | None, results: Sequence[DeletionResult | ToolDeletionResult]
-) -> None:
+def show_deletion_summary(parent: QWidget | None, results: Sequence[AnyDeletionResult]) -> None:
     """Informational summary of one deletion batch; failures are listed."""
     dialog = QDialog(parent)
     dialog.setWindowTitle("Deletion summary")

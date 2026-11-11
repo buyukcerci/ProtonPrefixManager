@@ -35,6 +35,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Protocol, TypeVar
 
 import vdf
 
@@ -52,6 +53,15 @@ SYSTEM_TOOLS_DIR = Path("/usr/share/steam/compatibilitytools.d")
 # walk, which cannot pin the directory inode; see _scan_dir_fd.
 _DIR_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _FD_ENUM_SUPPORTED = hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW")
+
+
+class PinnedRow(Protocol):
+    """A row built by scan_pinned_dir; it receives its entry's identity."""
+
+    dev_ino: tuple[int, int] | None
+
+
+RowT = TypeVar("RowT", bound=PinnedRow)
 
 
 class CompatToolParseError(ValueError):
@@ -289,7 +299,7 @@ def _custom_tools(root: SteamRoot) -> tuple[list[Tool], list[EnumerationWarning]
     def build(name: str) -> Tool:
         return _custom_tool(toolsdir / name, root.path)
 
-    return _scan_tool_dir(toolsdir, "tools", build)
+    return scan_pinned_dir(toolsdir, "tools", build)
 
 
 def _read_tool_vdf(vdf_path: Path) -> tuple[str | None, bool]:
@@ -333,17 +343,18 @@ def _custom_tool(entry: Path, root: Path, *, read_only: bool = False) -> Tool:
     )
 
 
-def _scan_tool_dir(
+def scan_pinned_dir(
     dir_path: Path,
     kind: str,
-    build: Callable[[str], Tool | None],
-) -> tuple[list[Tool], list[EnumerationWarning]]:
-    """Enumerate the direct children of one tools or common directory.
+    build: Callable[[str], RowT | None],
+) -> tuple[list[RowT], list[EnumerationWarning]]:
+    """Enumerate the direct child directories of dir_path.
 
-    kind names the directory in warning messages, for example "tools" or
-    "common". build receives one entry name and returns a Tool, or None
-    to leave the entry out. A missing directory is a normal empty state
-    with no warning.
+    kind names the directory in warning messages, for example "tools",
+    "common" or "shadercache". build receives one entry name and returns
+    a row, or None to leave the entry out; each returned row gets the
+    entry's device and inode in dev_ino. A missing directory is a normal
+    empty state with no warning. Used for tools and shader caches.
     """
     if _FD_ENUM_SUPPORTED:
         return _scan_dir_fd(dir_path, kind, build)
@@ -353,8 +364,8 @@ def _scan_tool_dir(
 def _scan_dir_fd(
     dir_path: Path,
     kind: str,
-    build: Callable[[str], Tool | None],
-) -> tuple[list[Tool], list[EnumerationWarning]]:
+    build: Callable[[str], RowT | None],
+) -> tuple[list[RowT], list[EnumerationWarning]]:
     """Enumerate dir_path through a pinned directory descriptor.
 
     The directory is opened once with O_NOFOLLOW and O_DIRECTORY, so a
@@ -399,7 +410,7 @@ def _scan_dir_fd(
         except OSError:
             message = f"skipped unreadable {kind} directory: {dir_path}"
             return [], [EnumerationWarning(message=message, path=dir_path)]
-        tools: list[Tool] = []
+        tools: list[RowT] = []
         for name in names:
             try:
                 entry_stat = os.stat(name, dir_fd=fd, follow_symlinks=False)
@@ -451,8 +462,8 @@ def _same_inode(dir_path: Path, identity: os.stat_result) -> bool:
 def _scan_dir_path(
     dir_path: Path,
     kind: str,
-    build: Callable[[str], Tool | None],
-) -> tuple[list[Tool], list[EnumerationWarning]]:
+    build: Callable[[str], RowT | None],
+) -> tuple[list[RowT], list[EnumerationWarning]]:
     """Path-based fallback for platforms without the directory open flags.
 
     This walk cannot pin the directory inode, so a symlinked dir_path is
@@ -473,7 +484,7 @@ def _scan_dir_path(
     except OSError:
         message = f"skipped unreadable {kind} directory: {dir_path}"
         return [], [EnumerationWarning(message=message, path=dir_path)]
-    tools: list[Tool] = []
+    tools: list[RowT] = []
     for entry in entries:
         if entry.is_symlink() or not entry.is_dir():
             continue
@@ -496,7 +507,7 @@ def _managed_tools(library: Library) -> tuple[list[Tool], list[EnumerationWarnin
             read_only=True,
         )
 
-    return _scan_tool_dir(commondir, "common", build)
+    return scan_pinned_dir(commondir, "common", build)
 
 
 def _system_tools() -> list[Tool]:
