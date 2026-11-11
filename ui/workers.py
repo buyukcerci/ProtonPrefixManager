@@ -16,12 +16,13 @@ from PySide6.QtCore import QObject, QRunnable, Signal
 
 from core.deletion import (
     DeleteMode,
+    DeletionResult,
     DeletionStatus,
     FailureKind,
     RejectReason,
     ToolDeletionResult,
-    delete_prefixes,
     delete_tools,
+    iter_delete_prefixes,
 )
 from core.discovery import (
     DiscoveryError,
@@ -33,7 +34,7 @@ from core.discovery import (
 )
 from core.enumeration import enumerate_from_discovery
 from core.models import Prefix
-from core.opener import open_folder
+from core.opener import OpenResult, OpenStatus, open_folder
 from core.scanner import scan_prefix, scan_prefixes
 from core.toolmap import contributing_roots, load_tool_mapping
 from core.tools import Tool, used_by
@@ -78,7 +79,11 @@ class ScanSignals(QObject):
 
 
 class ScanWorker(QRunnable):
-    """Streams scan events for the given prefixes, mutating the cache dict."""
+    """Streams scan events for the given prefixes.
+
+    The cache passed in is only read (as a snapshot); persisting results
+    is the receiver's job, done on the GUI thread from the events.
+    """
 
     def __init__(
         self,
@@ -127,12 +132,49 @@ class DeletionWorker(QRunnable):
         self._libraries = list(libraries)
         self._mode = mode
         self.epoch = epoch
+        self._emitted_targets: set[str] = set()
         self.signals = DeletionSignals()
 
     def run(self) -> None:
-        for result in delete_prefixes(self._prefixes, self._libraries, self._mode):
-            self.signals.result_ready.emit(result, self.epoch)
-        self.signals.finished.emit(self.epoch)
+        """Stream one result per target; finished always emits.
+
+        Results come from iter_delete_prefixes as each target is handled,
+        so when the batch raises partway through, only targets that were
+        not reported yet get a synthetic FAILED result; targets already
+        deleted keep their DELETED result. Aliases resolving to a reported
+        target are not reported again, matching delete_prefixes' grouping.
+        """
+        try:
+            for result in iter_delete_prefixes(self._prefixes, self._libraries, self._mode):
+                self._emitted_targets.add(_target_key(result.prefix))
+                self.signals.result_ready.emit(result, self.epoch)
+        except Exception as exc:
+            _logger.error("deletion worker failed: %s", exc)
+            for prefix in self._prefixes:
+                key = _target_key(prefix)
+                if key in self._emitted_targets:
+                    continue
+                self._emitted_targets.add(key)
+                self.signals.result_ready.emit(
+                    DeletionResult(
+                        prefix=prefix,
+                        mode=self._mode,
+                        status=DeletionStatus.FAILED,
+                        failure_kind=FailureKind.OS,
+                        error=str(exc),
+                    ),
+                    self.epoch,
+                )
+        finally:
+            self.signals.finished.emit(self.epoch)
+
+
+def _target_key(prefix: Prefix) -> str:
+    """Resolved target path, the unit delete_prefixes groups and reports by."""
+    try:
+        return str(prefix.path.expanduser().resolve(strict=False))
+    except (OSError, RuntimeError):
+        return str(prefix.path)
 
 
 class OpenFolderSignals(QObject):
@@ -148,7 +190,18 @@ class OpenFolderWorker(QRunnable):
         self.signals = OpenFolderSignals()
 
     def run(self) -> None:
-        self.signals.finished.emit(open_folder(self._path))
+        result = OpenResult(path=self._path, status=OpenStatus.LAUNCH_FAILED)
+        try:
+            result = open_folder(self._path)
+        except Exception as exc:
+            _logger.error("open folder worker failed: %s", exc)
+            result = OpenResult(
+                path=self._path,
+                status=OpenStatus.LAUNCH_FAILED,
+                error=str(exc),
+            )
+        finally:
+            self.signals.finished.emit(result)
 
 
 class ToolSizeSignals(QObject):
@@ -172,14 +225,20 @@ class ToolSizeWorker(QRunnable):
         self.signals = ToolSizeSignals()
 
     def run(self) -> None:
-        for tool in self._tools:
-            if self._is_stale is not None and self._is_stale():
-                break
-            result = scan_prefix(tool.path, should_stop=self._is_stale)
-            if self._is_stale is not None and self._is_stale():
-                break
-            self.signals.sized.emit((str(tool.path), result.size_bytes, result.error), self.epoch)
-        self.signals.finished.emit(self.epoch)
+        try:
+            for tool in self._tools:
+                if self._is_stale is not None and self._is_stale():
+                    break
+                result = scan_prefix(tool.path, should_stop=self._is_stale)
+                if self._is_stale is not None and self._is_stale():
+                    break
+                self.signals.sized.emit(
+                    (str(tool.path), result.size_bytes, result.error), self.epoch
+                )
+        except Exception as exc:
+            _logger.error("tool size worker failed: %s", exc)
+        finally:
+            self.signals.finished.emit(self.epoch)
 
 
 class ToolDeletionSignals(QObject):

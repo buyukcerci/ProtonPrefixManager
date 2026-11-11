@@ -162,6 +162,19 @@ def save_cached(cache: dict[str, dict], prefix: Prefix) -> None:
     cache[cache_key(prefix)] = entry
 
 
+def record_scan(cache: dict[str, dict], prefix: Prefix) -> None:
+    """Persist one completed scan: save a nonzero sized result, else drop the entry.
+
+    Zero sizes are never cached (see load_cached), and a prefix without a
+    scan timestamp has nothing trustworthy to store. This is the single
+    place that rule lives; both the scanner and the UI call it.
+    """
+    if prefix.size_bytes != 0 and prefix.last_scanned is not None:
+        save_cached(cache, prefix)
+    else:
+        invalidate(cache, prefix)
+
+
 def invalidate(cache: dict[str, dict], target: Prefix | Path) -> None:
     """Remove the cache entry for target if present."""
     cache.pop(cache_key(target), None)
@@ -341,10 +354,7 @@ def _scan_one(
         modified=result.modified,
     )
     if cache is not None:
-        if scanned.size_bytes != 0:
-            save_cached(cache, scanned)
-        else:
-            invalidate(cache, scanned)
+        record_scan(cache, scanned)
     yield ScanEvent(kind=ScanEventKind.COMPLETED, prefix=scanned, size_bytes=scanned.size_bytes)
 
 

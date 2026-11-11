@@ -141,3 +141,72 @@ def test_run_opener_seam_real_subprocess_success() -> None:
 def test_run_opener_seam_real_subprocess_failure() -> None:
     error = opener_module._run_opener(["false"])
     assert error is not None and "exit 1" in error
+
+
+def test_can_open_returns_false_on_oserror(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken_is_dir(self: Path) -> bool:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "is_dir", broken_is_dir)
+    assert can_open(tmp_path) is False
+
+
+def test_open_folder_returns_inaccessible_when_is_dir_raises_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_opener
+) -> None:
+    calls, _ = run_opener
+
+    def broken_is_dir(self: Path) -> bool:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "is_dir", broken_is_dir)
+    result = open_folder(tmp_path)
+    assert result.status is OpenStatus.INACCESSIBLE
+    assert result.path == tmp_path
+    assert result.error is not None and "Permission denied" in result.error
+    assert calls == []
+
+
+def test_open_folder_returns_launch_failed_when_run_opener_raises_oserror(
+    tmp_path: Path, which, run_opener
+) -> None:
+    _, outcomes = run_opener
+    which["xdg-open"] = "/usr/bin/xdg-open"
+    outcomes[0] = PermissionError(13, "Permission denied")
+    result = open_folder(tmp_path)
+    assert result.status is OpenStatus.LAUNCH_FAILED
+    assert result.error is not None and "Permission denied" in result.error
+
+
+def test_open_folder_returns_inaccessible_on_symlink_loop_runtime_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_opener
+) -> None:
+    calls, _ = run_opener
+
+    def looping_resolve(self: Path, strict: bool = False) -> Path:
+        raise RuntimeError("Symlink loop from '/x'")
+
+    monkeypatch.setattr(Path, "resolve", looping_resolve)
+    result = open_folder(tmp_path)
+    assert result.status is OpenStatus.INACCESSIBLE
+    assert result.error is not None and "loop" in result.error
+    assert calls == []
+
+
+def test_open_folder_tries_next_opener_when_exec_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, which
+) -> None:
+    which["xdg-open"] = "/usr/bin/xdg-open"
+    which["nautilus"] = "/usr/bin/nautilus"
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> str | None:
+        calls.append(argv)
+        if argv[0] == "xdg-open":
+            raise PermissionError(13, "Permission denied")
+        return None
+
+    monkeypatch.setattr(opener_module, "_run_opener", fake_run)
+    result = open_folder(tmp_path)
+    assert result.status is OpenStatus.OPENED
+    assert [argv[0] for argv in calls] == ["xdg-open", "nautilus"]

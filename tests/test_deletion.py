@@ -349,3 +349,68 @@ def test_final_check_symlink_swap_rejected(tmp_path: Path) -> None:
     missing = tmp_path / "gone"
     assert _final_check(missing) is RejectReason.MISSING
     assert _final_check(real) is None
+
+
+def test_delete_rejects_symlinked_compatdata_directory(
+    tmp_path: Path, trash_calls: list[Path]
+) -> None:
+    outside_compatdata = tmp_path / "outside_compatdata"
+    target = outside_compatdata / "480"
+    target.mkdir(parents=True)
+    lib_path = tmp_path / "lib"
+    (lib_path / "steamapps").mkdir(parents=True)
+    (lib_path / "steamapps" / "compatdata").symlink_to(outside_compatdata, target_is_directory=True)
+    library = Library(path=lib_path.resolve(), root=tmp_path.resolve())
+    prefix = Prefix(
+        app_id=480,
+        name="Game",
+        prefix_type=PrefixType.STEAM,
+        path=target.resolve(),
+        library=str(library.path),
+    )
+    results = delete_prefixes([prefix], [library])
+    assert len(results) == 1
+    assert results[0].status is DeletionStatus.REJECTED
+    assert results[0].reject_reason is RejectReason.SYMLINK
+    assert trash_calls == []
+    assert target.is_dir()
+
+
+def test_delete_rejects_symlinked_steamapps_directory(
+    tmp_path: Path, trash_calls: list[Path]
+) -> None:
+    outside_steamapps = tmp_path / "outside_steamapps"
+    target = outside_steamapps / "compatdata" / "480"
+    target.mkdir(parents=True)
+    lib_path = tmp_path / "lib"
+    lib_path.mkdir(parents=True)
+    (lib_path / "steamapps").symlink_to(outside_steamapps, target_is_directory=True)
+    library = Library(path=lib_path.resolve(), root=tmp_path.resolve())
+    prefix = Prefix(
+        app_id=480,
+        name="Game",
+        prefix_type=PrefixType.STEAM,
+        path=target.resolve(),
+        library=str(library.path),
+    )
+    results = delete_prefixes([prefix], [library])
+    assert len(results) == 1
+    assert results[0].status is DeletionStatus.REJECTED
+    assert results[0].reject_reason is RejectReason.SYMLINK
+    assert trash_calls == []
+    assert target.is_dir()
+
+
+def test_iter_delete_prefixes_yields_before_later_targets_run(
+    tmp_path: Path, trash_calls: list[Path]
+) -> None:
+    from core.deletion import iter_delete_prefixes
+
+    library, compatdata = _make_library(tmp_path)
+    first = _make_prefix(compatdata, 100)
+    second = _make_prefix(compatdata, 200)
+    results = iter_delete_prefixes([first, second], [library])
+    assert next(results).status is DeletionStatus.DELETED
+    assert len(trash_calls) == 1
+    assert next(results).status is DeletionStatus.DELETED
+    assert len(trash_calls) == 2

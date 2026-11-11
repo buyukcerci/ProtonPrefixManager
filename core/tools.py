@@ -169,13 +169,14 @@ def enumerate_tools(
     deletable tool, and a swap of the directory path before or during
     enumeration discards that root's rows and reports the same warning
     kind. Entry-level symlinks and non-directories are skipped silently.
-    Rows dedupe on resolved path with the first occurrence winning,
-    including its name_unverified flag and its recorded entry identity;
+    Rows dedupe on resolved path with the first occurrence winning its
+    recorded entry identity while read_only and name_unverified flags
+    merge conservatively across aliases;
     warnings dedupe on the skipped path.
     """
     tools: list[Tool] = []
     warnings: list[EnumerationWarning] = []
-    seen_tools: set[str] = set()
+    seen_tools: dict[str, Tool] = {}
     seen_warnings: set[str] = set()
 
     def merge(
@@ -184,9 +185,13 @@ def enumerate_tools(
     ) -> None:
         for tool in new_tools:
             key = str(tool.path)
-            if key not in seen_tools:
-                seen_tools.add(key)
+            existing = seen_tools.get(key)
+            if existing is None:
+                seen_tools[key] = tool
                 tools.append(tool)
+            else:
+                existing.read_only = existing.read_only or tool.read_only
+                existing.name_unverified = existing.name_unverified or tool.name_unverified
         for warning in new_warnings:
             key = str(warning.path)
             if key not in seen_warnings:

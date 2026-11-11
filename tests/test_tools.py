@@ -1195,3 +1195,32 @@ def test_delete_rejects_conflicting_alias_name_mismatch(
     assert results[0].reject_reason is RejectReason.NAME_MISMATCH
     assert trash_calls == []
     assert target.is_dir()
+
+
+def test_custom_root_aliasing_system_dir_preserves_read_only_and_unverified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _make_root(tmp_path)
+    toolsdir = root.path / "compatibilitytools.d"
+    _write_tool(toolsdir, "DistroBuild", vdf_text='"compatibilitytools"\n{\n')
+    monkeypatch.setattr(tools_module, "SYSTEM_TOOLS_DIR", toolsdir)
+
+    tools = _enumerate([root], [])
+    assert len(tools) == 1
+    assert tools[0].read_only is True
+    assert tools[0].name_unverified is True
+
+
+def test_custom_root_aliasing_managed_common_dir_preserves_read_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_lib = _make_library(tmp_path, "real_lib")
+    common = real_lib.path / "steamapps" / "common"
+    _write_tool(common, "Proton 9.0", vdf_text='"compatibilitytools"\n{\n')
+    custom_root = SteamRoot(path=real_lib.path / "steamapps", source=RootSource.CUSTOM)
+    monkeypatch.setattr(tools_module, "COMPAT_TOOLS_DIR", "common")
+
+    tools = _enumerate([custom_root], [real_lib])
+    assert len(tools) == 1
+    assert tools[0].read_only is True
+    assert tools[0].name_unverified is True

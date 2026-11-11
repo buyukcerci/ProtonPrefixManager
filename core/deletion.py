@@ -21,7 +21,7 @@ import logging
 import os
 import shutil
 import stat
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -30,6 +30,7 @@ from send2trash import send2trash
 
 from core import tools as tools_module
 from core.discovery import COMPATDATA_DIR, STEAMAPPS_DIR, Library, SteamRoot
+from core.enumeration import compatdata_symlink, is_real_dir, library_compatdata_dir
 from core.models import Prefix
 from core.tools import COMMON_DIR, COMPAT_TOOLS_DIR, Tool
 
@@ -131,6 +132,21 @@ def delete_prefixes(
 ) -> list[DeletionResult]:
     """Delete each validated prefix, returning one result per unique target.
 
+    List form of iter_delete_prefixes; see there for the rules.
+    """
+    return list(iter_delete_prefixes(prefixes, libraries, mode))
+
+
+def iter_delete_prefixes(
+    prefixes: Sequence[Prefix],
+    libraries: Sequence[Library],
+    mode: DeleteMode = DeleteMode.TRASH,
+) -> Iterator[DeletionResult]:
+    """Delete each validated prefix, yielding one result per unique target.
+
+    Each result is yielded as soon as its target is handled, so a caller
+    that sees an exception knows exactly which targets were already done.
+
     Inputs are grouped by resolved target path and results keep
     first-seen order. When several records resolve to one target the
     flags merge conservatively: any alias whose name does not match the
@@ -149,45 +165,46 @@ def delete_prefixes(
             grouped[key] = []
             order.append(key)
         grouped[key].append((prefix, target))
-    results: list[DeletionResult] = []
     for key in order:
         aliases = [prefix for prefix, _ in grouped[key]]
         first = aliases[0]
         target = grouped[key][0][1]
         expanded = [alias.path.expanduser() for alias in aliases]
         if any(raw.is_symlink() or _unresolved_parent_has_symlink(raw) for raw in expanded):
-            results.append(
-                DeletionResult(
-                    prefix=first,
-                    mode=mode,
-                    status=DeletionStatus.REJECTED,
-                    reject_reason=RejectReason.SYMLINK,
-                )
+            yield DeletionResult(
+                prefix=first,
+                mode=mode,
+                status=DeletionStatus.REJECTED,
+                reject_reason=RejectReason.SYMLINK,
             )
             continue
         if any(
             target.name != str(alias.app_id) or raw.name != str(alias.app_id)
             for alias, raw in zip(aliases, expanded, strict=True)
         ):
-            results.append(
-                DeletionResult(
-                    prefix=first,
-                    mode=mode,
-                    status=DeletionStatus.REJECTED,
-                    reject_reason=RejectReason.NAME_MISMATCH,
-                )
+            yield DeletionResult(
+                prefix=first,
+                mode=mode,
+                status=DeletionStatus.REJECTED,
+                reject_reason=RejectReason.NAME_MISMATCH,
             )
             continue
-        results.append(_delete_one(first, target, mode, compatdatas))
-    return results
+        yield _delete_one(first, target, mode, compatdatas)
 
 
 def _current_compatdatas(libraries: Sequence[Library]) -> list[Path]:
-    """Resolved, deduplicated compatdata paths of the current library set."""
+    """Resolved, deduplicated compatdata paths of the current library set.
+
+    A library whose steamapps or compatdata is a symlink is left out, so a
+    link cannot relocate the approval boundary; see library_compatdata_dir.
+    """
     result: list[Path] = []
     seen: set[str] = set()
     for library in libraries:
-        path = compatdata_path(library)
+        raw = library_compatdata_dir(library)
+        if raw is None:
+            continue
+        path = raw.resolve(strict=False)
         key = str(path)
         if key not in seen:
             seen.add(key)
@@ -289,10 +306,13 @@ def _validate(
     if parent not in compatdatas:
         if any(_is_strict_child(parent, compatdata) for compatdata in compatdatas):
             return reject(RejectReason.NOT_DIRECT_CHILD)
-        implied = (Path(prefix.library).expanduser() / STEAMAPPS_DIR / COMPATDATA_DIR).resolve(
-            strict=False
-        )
+        library_path = Path(prefix.library).expanduser()
+        implied = (library_path / STEAMAPPS_DIR / COMPATDATA_DIR).resolve(strict=False)
         if parent == implied and implied not in compatdatas:
+            # A library left out of the boundary because its steamapps or
+            # compatdata is a symlink is not stale; say why it was refused.
+            if compatdata_symlink(library_path) is not None:
+                return reject(RejectReason.SYMLINK)
             return reject(RejectReason.STALE_LIBRARY)
         return reject(RejectReason.NOT_IN_COMPATDATA)
 
@@ -480,18 +500,10 @@ def _current_toolsdirs(roots: Sequence[SteamRoot | Path]) -> list[Path]:
         if key in seen:
             continue
         seen.add(key)
-        if not _is_real_dir(raw):
+        if not is_real_dir(raw):
             continue
         result.append(raw.resolve(strict=False))
     return result
-
-
-def _is_real_dir(path: Path) -> bool:
-    """True when path is a directory and not a symlink; errors fail closed."""
-    try:
-        return stat.S_ISDIR(os.stat(path, follow_symlinks=False).st_mode)
-    except OSError:
-        return False
 
 
 def _identity_matches(target: Path, dev_ino: tuple[int, int]) -> bool:

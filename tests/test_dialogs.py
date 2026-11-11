@@ -152,6 +152,15 @@ def test_tools_pending_note_for_selection(tmp_path: Path) -> None:
     assert tools_pending_note_for([], {str(tools[0].path)}) is None
 
 
+def test_tools_pending_note_for_failed_scan(tmp_path: Path) -> None:
+    tools = [_tool("Alpha", tmp_path), _tool("Beta", tmp_path)]
+    note = tools_pending_note_for(tools, set(), {str(tools[1].path)})
+    assert note is not None
+    assert "could not be measured" in note
+    assert "not been measured yet" not in note
+    assert tools_pending_note_for(tools, set(), {"/elsewhere"}) is None
+
+
 def test_summary_body_lists_every_non_deleted_result() -> None:
     deleted_prefix = _prefix(1, "Gone")
     rejected_prefix = _prefix(2, "Ghost")

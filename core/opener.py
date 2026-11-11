@@ -2,8 +2,10 @@
 
 Only directory paths that currently exist are ever launched, the resolved
 absolute path is always passed as a single argv element (never through a
-shell), and a real launcher failure is surfaced instead of being retried
-silently on the next candidate.
+shell), and a real launcher failure (the opener ran and exited non-zero or
+timed out) is surfaced instead of being retried silently on the next
+candidate. An opener that cannot even be executed counts as unavailable,
+so the next candidate is tried.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ class OpenStatus(StrEnum):
 
     OPENED = "opened"
     MISSING_PATH = "missing_path"
+    INACCESSIBLE = "inaccessible"
     NO_OPENER = "no_opener"
     LAUNCH_FAILED = "launch_failed"
 
@@ -39,17 +42,27 @@ class OpenResult:
 
 def can_open(path: Path) -> bool:
     """True when path is an existing directory and can be handed to an opener."""
-    return path.is_dir()
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
 
 
 def open_folder(path: Path) -> OpenResult:
     """Open path with the first available opener, returning a structured result."""
-    resolved = path.expanduser().resolve(strict=False)
-    if not resolved.is_dir():
-        return OpenResult(path=resolved, status=OpenStatus.MISSING_PATH)
+    try:
+        resolved = path.expanduser().resolve(strict=False)
+        if not resolved.is_dir():
+            return OpenResult(path=resolved, status=OpenStatus.MISSING_PATH)
+    except FileNotFoundError:
+        return OpenResult(path=path, status=OpenStatus.MISSING_PATH)
+    except (OSError, RuntimeError) as exc:
+        # RuntimeError: Python < 3.13 raises it from resolve() on a symlink loop.
+        return OpenResult(path=path, status=OpenStatus.INACCESSIBLE, error=str(exc))
     candidates = [name for name in OPENERS if shutil.which(name)]
     if not candidates:
         return OpenResult(path=resolved, status=OpenStatus.NO_OPENER)
+    exec_error: str | None = None
     for name in candidates:
         try:
             error = _run_opener([name, str(resolved)])
@@ -57,9 +70,15 @@ def open_folder(path: Path) -> OpenResult:
             continue
         except subprocess.TimeoutExpired as exc:
             return OpenResult(path=resolved, status=OpenStatus.LAUNCH_FAILED, error=str(exc))
+        except OSError as exc:
+            # Could not exec this opener (EACCES, ENOEXEC, ...); try the next one.
+            exec_error = f"{name}: {exc}"
+            continue
         if error is None:
             return OpenResult(path=resolved, status=OpenStatus.OPENED)
         return OpenResult(path=resolved, status=OpenStatus.LAUNCH_FAILED, error=error)
+    if exec_error is not None:
+        return OpenResult(path=resolved, status=OpenStatus.LAUNCH_FAILED, error=exec_error)
     return OpenResult(path=resolved, status=OpenStatus.NO_OPENER)
 
 

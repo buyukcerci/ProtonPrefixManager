@@ -303,3 +303,31 @@ def test_header_shows_all_when_runtime_excluded(tmp_path: Path) -> None:
     assert model.selection_state(exclude_runtime=False) is SelectionState.SOME
     store.clear_selection()
     assert model.selection_state(exclude_runtime=True) is SelectionState.NONE
+
+
+def test_set_store_and_set_rows_survive_permission_error_on_is_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    ok_prefix = _make_prefix(tmp_path, "ok", 100, size=10)
+    blocked_prefix = _make_prefix(tmp_path, "blocked", 200, size=20)
+    orig_is_dir = Path.is_dir
+
+    def fake_is_dir(self: Path) -> bool:
+        if self == blocked_prefix.path:
+            raise PermissionError(13, "Permission denied")
+        return orig_is_dir(self)
+
+    monkeypatch.setattr(Path, "is_dir", fake_is_dir)
+
+    store = Store()
+    store.merge([ok_prefix, blocked_prefix])
+    model = PrefixTableModel()
+    model.set_store(store)
+    assert model.rowCount() == 2
+    assert model.open_enabled(0) is True
+    assert model.open_enabled(1) is False
+
+    model.set_rows([blocked_prefix, ok_prefix])
+    assert model.rowCount() == 2
+    assert model.open_enabled(0) is False
+    assert model.open_enabled(1) is True

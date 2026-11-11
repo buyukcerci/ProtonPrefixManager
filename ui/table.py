@@ -34,6 +34,7 @@ from core.models import (
     format_size,
     prefix_key,
 )
+from core.opener import can_open
 from ui.sanitize import sanitize_display, sanitize_tooltip
 from ui.styles import (
     APP_ID_DEFAULT_PX,
@@ -108,7 +109,7 @@ class PrefixTableModel(QAbstractTableModel):
         self._error_provider = error_provider
         self._tool_provider = tool_provider
         self._highlighted_key: tuple[int, str] | None = None
-        self._highlight_timer = QTimer()
+        self._highlight_timer = QTimer(self)
         self._highlight_timer.setSingleShot(True)
         self._highlight_timer.timeout.connect(self.clear_highlight)
 
@@ -120,7 +121,7 @@ class PrefixTableModel(QAbstractTableModel):
         self.beginResetModel()
         self._store = store
         self._rows = list(store.prefixes)
-        self._openable = [prefix.path.is_dir() for prefix in self._rows]
+        self._openable = [can_open(prefix.path) for prefix in self._rows]
         self.endResetModel()
 
     def set_rows(
@@ -132,7 +133,7 @@ class PrefixTableModel(QAbstractTableModel):
         self.beginResetModel()
         self._rows = list(rows)
         if rescan_openable or len(self._openable) != len(self._rows):
-            self._openable = [prefix.path.is_dir() for prefix in self._rows]
+            self._openable = [can_open(prefix.path) for prefix in self._rows]
         self.endResetModel()
 
     def set_tool_provider(self, provider: Callable[[Prefix], str | None] | None) -> None:

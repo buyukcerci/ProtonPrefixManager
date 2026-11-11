@@ -9,7 +9,9 @@ demotes the affected prefix to the next fallback (or skips that one source).
 
 from __future__ import annotations
 
+import os
 import re
+import stat
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -60,6 +62,60 @@ def enumerate_from_discovery(result: DiscoveryResult) -> list[Prefix]:
     return enumerate_prefixes(result.libraries, result.roots)
 
 
+def is_real_dir(path: Path) -> bool:
+    """True when path is a directory and not a symlink; errors fail closed.
+
+    A single lstat decides both conditions, so no swap can slip in
+    between a symlink check and a directory check.
+    """
+    try:
+        return stat.S_ISDIR(os.stat(path, follow_symlinks=False).st_mode)
+    except OSError:
+        return False
+
+
+def library_compatdata_dir(library: Library) -> Path | None:
+    """Lexical steamapps/compatdata path of a library, or None when unusable.
+
+    Both steamapps and compatdata must be real directories; a symlink at
+    either level is refused rather than followed, so the library cannot
+    relocate its prefixes (and the deletion boundary) elsewhere.
+    """
+    steamapps = library.path / STEAMAPPS_DIR
+    compatdata = steamapps / COMPATDATA_DIR
+    if is_real_dir(steamapps) and is_real_dir(compatdata):
+        return compatdata
+    return None
+
+
+def symlinked_compatdata_paths(libraries: Sequence[Library]) -> list[Path]:
+    """steamapps or compatdata paths that exist but are symlinks.
+
+    Libraries with such a path are skipped by enumerate_prefixes and by
+    the deletion boundary; this lets the UI report them instead of the
+    library silently showing no prefixes. A missing directory is normal
+    for a library without Proton games and is not reported.
+    """
+    result: list[Path] = []
+    for library in libraries:
+        link = compatdata_symlink(library.path)
+        if link is not None:
+            result.append(link)
+    return result
+
+
+def compatdata_symlink(library_path: Path) -> Path | None:
+    """The steamapps or compatdata path under library_path that is a symlink, if any."""
+    steamapps = library_path / STEAMAPPS_DIR
+    for path in (steamapps, steamapps / COMPATDATA_DIR):
+        try:
+            if stat.S_ISLNK(os.stat(path, follow_symlinks=False).st_mode):
+                return path
+        except OSError:
+            return None
+    return None
+
+
 def enumerate_prefixes(
     libraries: Sequence[Library],
     roots: Sequence[SteamRoot] | None = None,
@@ -75,20 +131,24 @@ def enumerate_prefixes(
     resolved path), keeping the first occurrence, using the same
     normalization as Store._dedupe_key. Symlinked compatdata children are
     intentionally skipped instead of followed, so prefixes relocated via
-    symlinks are never listed outside their library. Unreadable or missing
-    compatdata directories are skipped silently for v1.
+    symlinks are never listed outside their library. A library whose
+    steamapps or compatdata directory is itself a symlink is skipped the
+    same way; symlinked_compatdata_paths reports those so callers can warn.
+    Unreadable or missing compatdata directories are skipped silently.
     """
     shortcuts = dict(shortcuts_map) if shortcuts_map is not None else _load_shortcuts(roots or ())
     prefixes: list[Prefix] = []
     seen: set[tuple[int, str]] = set()
     for library in libraries:
-        compatdata = library.path / STEAMAPPS_DIR / COMPATDATA_DIR
+        compatdata = library_compatdata_dir(library)
+        if compatdata is None:
+            continue
         try:
             entries = sorted(compatdata.iterdir(), key=lambda entry: entry.name)
         except OSError:
             continue
         for entry in entries:
-            if entry.is_symlink() or not entry.is_dir():
+            if not is_real_dir(entry):
                 continue
             app_id = parse_ascii_decimal(entry.name)
             if app_id is None:

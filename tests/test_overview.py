@@ -768,3 +768,59 @@ def test_top_lists_fixed_widths(qtbot) -> None:
     assert page.top_list.maximumWidth() == OVERVIEW_PREFIX_CARD_WIDTH_PX
     assert page.tools_top_list.width() == OVERVIEW_TOOL_CARD_WIDTH_PX
     assert page.tools_top_list.maximumWidth() == OVERVIEW_TOOL_CARD_WIDTH_PX
+
+
+def test_tool_scan_status_text_excludes_failed_from_sized(qtbot) -> None:
+    from ui.overview import _tool_scan_status_text
+
+    t1 = _tool("Proton 8.0", size=100)
+    t2 = _tool("Proton 9.0", size=200)
+    t3 = _tool("Proton Experimental", size=0)
+    tools = [t1, t2, t3]
+
+    status = _tool_scan_status_text(tools, pending={str(t3.path)}, failed={str(t2.path)})
+    assert status == "1 of 3 tools sized, 1 scanning, 1 unavailable"
+
+    page = _page(qtbot)
+    page.update_tools(
+        tools,
+        used=set(),
+        pending={str(t3.path)},
+        failed={str(t2.path)},
+        capacity_bytes=None,
+    )
+    assert page._tools_status_label.text() == "1 of 3 tools sized, 1 scanning, 1 unavailable"
+    assert page.tools_treemap._items == [t1]
+
+
+def test_treemap_item_labels_sanitize_control_and_bidi_characters(qtbot) -> None:
+    from ui.overview import PrefixTreemapWidget, ToolTreemapWidget
+
+    prefix_treemap = PrefixTreemapWidget()
+    qtbot.addWidget(prefix_treemap)
+    dirty_prefix = _prefix(42, name="Game\u202e\x00\nTitle", size=500)
+    label = prefix_treemap._item_label(dirty_prefix)
+    assert "\u202e" not in label
+    assert "\x00" not in label
+    assert "\n" not in label
+    assert label == "Game Title"
+
+    tool_treemap = ToolTreemapWidget()
+    qtbot.addWidget(tool_treemap)
+    dirty_tool = _tool("Proton\u202e\x07\tCustom", size=500)
+    tool_label = tool_treemap._item_label(dirty_tool)
+    assert "\u202e" not in tool_label
+    assert "\x07" not in tool_label
+    assert "\t" not in tool_label
+    assert tool_label == "Proton Custom"
+
+
+def test_tool_scan_status_text_ignores_stale_paths() -> None:
+    from ui.overview import _tool_scan_status_text
+
+    t1 = _tool("Proton 8.0", size=100)
+    t2 = _tool("Proton 9.0", size=0)
+    status = _tool_scan_status_text(
+        [t1, t2], pending={"/gone/a"}, failed={str(t2.path), "/gone/b", "/gone/c"}
+    )
+    assert status == "1 of 2 tools sized, 1 unavailable"

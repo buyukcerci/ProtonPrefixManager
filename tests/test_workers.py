@@ -577,3 +577,95 @@ def test_scan_worker_finished_barrier_on_exception(
     worker.signals.finished.connect(finished.append)
     worker.run()
     assert finished == [13]
+
+
+def test_deletion_worker_finished_barrier_and_remaining_failed_on_exception(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from core.deletion import DeletionResult, DeletionStatus, FailureKind
+    from core.discovery import Library
+    from ui import workers as workers_module
+
+    library_path = tmp_path / "lib"
+    compatdata = library_path / "steamapps" / "compatdata"
+    p1_dir = compatdata / "101"
+    p2_dir = compatdata / "202"
+    p1_dir.mkdir(parents=True)
+    p2_dir.mkdir(parents=True)
+    p1 = Prefix(
+        app_id=101,
+        name="G101",
+        prefix_type=PrefixType.ORPHANED,
+        path=p1_dir,
+        library=str(library_path),
+    )
+    p2 = Prefix(
+        app_id=202,
+        name="G202",
+        prefix_type=PrefixType.ORPHANED,
+        path=p2_dir,
+        library=str(library_path),
+    )
+    library = Library(path=library_path.resolve(), root=tmp_path.resolve())
+
+    def partially_failing_delete(*args: object, **kwargs: object):
+        yield DeletionResult(prefix=p1, mode=DeleteMode.TRASH, status=DeletionStatus.DELETED)
+        raise RuntimeError("crash after first prefix")
+
+    monkeypatch.setattr(workers_module, "iter_delete_prefixes", partially_failing_delete)
+    worker = DeletionWorker([p1, p2], [library], DeleteMode.TRASH, epoch=14)
+    events: list[tuple[object, int]] = []
+    finished: list[int] = []
+    worker.signals.result_ready.connect(lambda r, e: events.append((r, e)))
+    worker.signals.finished.connect(finished.append)
+    worker.run()
+
+    assert finished == [14]
+    assert [e for _, e in events] == [14, 14]
+    results = [r for r, _ in events]
+    assert len(results) == 2
+    assert results[0].prefix.app_id == 101
+    assert results[0].status is DeletionStatus.DELETED
+    assert results[1].prefix.app_id == 202
+    assert results[1].status is DeletionStatus.FAILED
+    assert results[1].failure_kind is FailureKind.OS
+    assert "crash after first prefix" in (results[1].error or "")
+
+
+def test_tool_size_worker_finished_barrier_on_exception(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from ui import workers as workers_module
+
+    def failing_scan_prefix(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("simulated tool scan crash")
+
+    monkeypatch.setattr(workers_module, "scan_prefix", failing_scan_prefix)
+    tool = Tool(name="Proton 9.0", path=tmp_path / "Proton 9.0", root=tmp_path, read_only=False)
+    worker = ToolSizeWorker([tool], epoch=15)
+    finished: list[int] = []
+    worker.signals.finished.connect(finished.append)
+    worker.run()
+    assert finished == [15]
+
+
+def test_open_folder_worker_finished_barrier_on_exception(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from ui import workers as workers_module
+
+    def failing_open_folder(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("simulated open folder crash")
+
+    monkeypatch.setattr(workers_module, "open_folder", failing_open_folder)
+    target = tmp_path / "dir"
+    worker = OpenFolderWorker(target)
+    results: list[object] = []
+    worker.signals.finished.connect(results.append)
+    worker.run()
+
+    assert len(results) == 1
+    result = results[0]
+    assert result.path == target  # type: ignore[attr-defined]
+    assert result.status is OpenStatus.LAUNCH_FAILED  # type: ignore[attr-defined]
+    assert "simulated open folder crash" in (result.error or "")  # type: ignore[attr-defined]

@@ -328,3 +328,45 @@ def test_appid_zero_ignored_across_libraries(tmp_path: Path) -> None:
     assert 480 in app_ids
     assert 999 in app_ids
     assert len(prefixes) == 2
+
+
+def test_symlinked_compatdata_directory_ignored(tmp_path: Path) -> None:
+    outside_compatdata = tmp_path / "outside_compatdata"
+    (outside_compatdata / "480").mkdir(parents=True)
+    lib_path = tmp_path / "SteamLibrary"
+    (lib_path / "steamapps").mkdir(parents=True)
+    (lib_path / "steamapps" / "compatdata").symlink_to(outside_compatdata, target_is_directory=True)
+    lib = Library(path=lib_path.resolve(), root=tmp_path.resolve())
+    assert enumerate_prefixes([lib]) == []
+
+
+def test_symlinked_steamapps_directory_ignored(tmp_path: Path) -> None:
+    outside_steamapps = tmp_path / "outside_steamapps"
+    (outside_steamapps / "compatdata" / "480").mkdir(parents=True)
+    lib_path = tmp_path / "SteamLibrary"
+    lib_path.mkdir(parents=True)
+    (lib_path / "steamapps").symlink_to(outside_steamapps, target_is_directory=True)
+    lib = Library(path=lib_path.resolve(), root=tmp_path.resolve())
+    assert enumerate_prefixes([lib]) == []
+
+
+def test_symlinked_compatdata_paths_reports_only_symlinks(tmp_path: Path) -> None:
+    from core.enumeration import symlinked_compatdata_paths
+
+    outside = tmp_path / "outside"
+    (outside / "480").mkdir(parents=True)
+    linked = tmp_path / "Linked"
+    (linked / "steamapps").mkdir(parents=True)
+    (linked / "steamapps" / "compatdata").symlink_to(outside, target_is_directory=True)
+    linked_steamapps = tmp_path / "LinkedSteamapps"
+    linked_steamapps.mkdir()
+    (linked_steamapps / "steamapps").symlink_to(tmp_path / "Linked" / "steamapps")
+    normal = tmp_path / "Normal"
+    (normal / "steamapps" / "compatdata").mkdir(parents=True)
+    empty = tmp_path / "Empty"
+    empty.mkdir()
+    libs = [Library(path=path, root=tmp_path) for path in (linked, linked_steamapps, normal, empty)]
+    assert symlinked_compatdata_paths(libs) == [
+        linked / "steamapps" / "compatdata",
+        linked_steamapps / "steamapps",
+    ]

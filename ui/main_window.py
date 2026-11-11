@@ -57,6 +57,7 @@ from core.discovery import (
     Library,
     SteamRoot,
 )
+from core.enumeration import symlinked_compatdata_paths
 from core.models import Prefix, PrefixType, ScanStatus, Store, format_size, prefix_key
 from core.opener import OpenStatus, can_open
 from core.scanner import (
@@ -65,6 +66,7 @@ from core.scanner import (
     cache_key,
     invalidate,
     load_cached,
+    record_scan,
     refresh_needed,
 )
 from core.toolmap import ToolMapError, contributing_roots, load_tool_mapping, tool_name_for
@@ -991,6 +993,15 @@ class MainWindow(QMainWindow):
         self._tools_search_text = text.strip()
         self._tools_search_timer.start()
 
+    def _clear_prefix_search(self) -> None:
+        """Reset the prefix search box without triggering a filter pass."""
+        self._search_text = ""
+        self._search_box.blockSignals(True)
+        self._search_box.clear()
+        self._search_box.blockSignals(False)
+        self._search_timer.stop()
+        self._update_search_placeholder()
+
     def _clear_tools_search(self) -> None:
         """Reset the tools search box without triggering a filter pass."""
         self._tools_search_text = ""
@@ -1064,7 +1075,7 @@ class MainWindow(QMainWindow):
             return
         names = [tool.name for tool in tools]
         total_text = format_size(sum(tool.size_bytes for tool in tools))
-        note = tools_pending_note_for(tools, self._tools_model.pending)
+        note = tools_pending_note_for(tools, self._tools_model.pending, self._tools_model.failed)
         if not confirm_selection(self, names, total_text, note, item_noun="tools"):
             return
         mode = confirm_final(self, len(tools), total_text, item_noun="tool(s)")
@@ -1352,8 +1363,17 @@ class MainWindow(QMainWindow):
         self._model.set_tool_provider(self._tool_for)
         tools, enumeration_warnings = enumerate_tools(self._roots, self._libraries)
         self._enumeration_warnings = list(enumeration_warnings)
+        # Prefix enumeration and deletion refuse symlinked steamapps or
+        # compatdata directories; say so instead of showing an empty library.
+        for link in symlinked_compatdata_paths(self._libraries):
+            self._enumeration_warnings.append(
+                EnumerationWarning(
+                    message="symlinked Steam directory skipped; its prefixes are not listed",
+                    path=link,
+                )
+            )
         self._discovery_errors = list(result.errors)
-        for warning in enumeration_warnings:
+        for warning in self._enumeration_warnings:
             _logger.warning("enumeration warning: %s (%s)", warning.message, warning.path)
         for err in result.errors:
             _logger.warning("discovery error: %s (%s)", err.message, err.path)
@@ -1424,7 +1444,7 @@ class MainWindow(QMainWindow):
         self._scan_total = len(pending)
         self._update_progress_text()
         scan_worker = ScanWorker(
-            pending, self._config.size_cache, epoch, is_stale=lambda: epoch != self._epoch
+            pending, dict(self._config.size_cache), epoch, is_stale=lambda: epoch != self._epoch
         )
         self._workers.add(scan_worker)
         scan_worker.signals.scan_event.connect(self._on_scan_event)
@@ -1444,6 +1464,8 @@ class MainWindow(QMainWindow):
             return
         assert isinstance(event.prefix, Prefix)
         self._store.upsert(event.prefix)
+        if event.kind is ScanEventKind.COMPLETED:
+            record_scan(self._config.size_cache, event.prefix)
         if event.kind is ScanEventKind.FAILED and event.error:
             self._scan_errors[cache_key(event.prefix)] = event.error
         self._scan_done += 1
@@ -1473,11 +1495,14 @@ class MainWindow(QMainWindow):
             and isinstance(size_bytes, int)
             and (error is None or isinstance(error, str))
         ):
+            # A failed scan's partial total is not trustworthy; count it as 0
+            # (the model marks the row failed so it is not shown as measured).
+            effective_size = 0 if error is not None else size_bytes
             self._all_tools = [
-                replace(tool, size_bytes=size_bytes) if str(tool.path) == path else tool
+                replace(tool, size_bytes=effective_size) if str(tool.path) == path else tool
                 for tool in self._all_tools
             ]
-            self._tools_model.set_tool_size(path, size_bytes, error)
+            self._tools_model.set_tool_size(path, effective_size, error)
             if self._tools_sort_key == "size":
                 self._apply_tools_filter()
             self._tools_overview_timer.start()
@@ -1633,21 +1658,23 @@ class MainWindow(QMainWindow):
         if self._pending_filter_reset:
             self._pending_filter_reset = False
             self._set_type_filter(set(PrefixType))
-            self._search_text = ""
-            self._search_box.blockSignals(True)
-            self._search_box.clear()
-            self._search_box.blockSignals(False)
-            self._search_timer.stop()
-            self._update_search_placeholder()
+            self._clear_prefix_search()
         if self._pending_select_all_visible:
             self._pending_select_all_visible = False
+            self._clear_prefix_search()
             self._apply_filters()
-            # Runtime components stay visible but are never auto-selected;
-            # mass-deleting them from orphan review would remove Steam's
-            # own tooling by accident.
-            self._store.select_visible(self._model.rows(), exclude_runtime=True)
-            self._model.refresh_all_check_states()
-            self._table.set_header_state(self._model.selection_state(exclude_runtime=True))
+            # The selection is left alone while a deletion runs; the batch
+            # already holds its own list and the window refreshes after it.
+            if not self._deleting:
+                # Prior picks are dropped: the orphan filter hides them, and
+                # a hidden selection would be deleted along with the orphans.
+                self._store.clear_selection()
+                # Runtime components stay visible but are never auto-selected;
+                # mass-deleting them from orphan review would remove Steam's
+                # own tooling by accident.
+                self._store.select_visible(self._model.rows(), exclude_runtime=True)
+                self._model.refresh_all_check_states()
+                self._table.set_header_state(self._model.selection_state(exclude_runtime=True))
         key = self._pending_highlight_key
         if key is not None:
             self._pending_highlight_key = None

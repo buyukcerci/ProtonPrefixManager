@@ -177,8 +177,13 @@ def unscanned_note_for(prefixes: Sequence[Prefix]) -> str | None:
     return "Some sizes have not been scanned yet; the total may be understated."
 
 
-def tools_pending_note_for(tools: Sequence[Tool], pending: set[str]) -> str | None:
-    """Note shown when any selected tool still awaits its size."""
-    if any(str(tool.path) in pending for tool in tools):
+def tools_pending_note_for(
+    tools: Sequence[Tool], pending: set[str], failed: set[str] | None = None
+) -> str | None:
+    """Note shown when any selected tool still awaits its size or failed to size."""
+    paths = {str(tool.path) for tool in tools}
+    if paths & (failed or set()):
+        return "Some tool sizes could not be measured and count as 0; the total may be understated."
+    if paths & pending:
         return "Some tool sizes have not been measured yet; the total may be understated."
     return None

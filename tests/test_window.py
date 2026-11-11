@@ -2186,3 +2186,182 @@ def test_warning_tooltip_capped_at_max_lines(qtbot, isolated_env: Path) -> None:
     assert "error 0" in tooltip
     assert "error 19" in tooltip
     assert "error 20" not in tooltip
+
+
+def test_scan_worker_gets_size_cache_copy_and_ui_updates_on_completed(
+    qtbot, isolated_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from core.scanner import cache_key
+    from ui import main_window as main_window_module
+
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    payload = _synthetic_payload(isolated_env / "scan_cache", app_ids=(480,))
+    prefix = payload[1][0]
+    key = cache_key(prefix)
+
+    captured_caches: list[dict[str, object]] = []
+
+    class DummySignals:
+        class _Sig:
+            def connect(self, _slot: object) -> None:
+                pass
+
+        def __init__(self) -> None:
+            self.scan_event = self._Sig()
+            self.finished = self._Sig()
+
+    class DummyScanWorker:
+        def __init__(
+            self,
+            prefixes: list[Prefix],
+            cache: dict[str, object],
+            epoch: int,
+            is_stale: object = None,
+        ) -> None:
+            captured_caches.append(cache)
+            self.signals = DummySignals()
+
+    monkeypatch.setattr(main_window_module, "ScanWorker", DummyScanWorker)
+    monkeypatch.setattr(
+        main_window_module.QThreadPool,
+        "globalInstance",
+        lambda: type(
+            "_Pool",
+            (),
+            {"start": lambda self, w: None, "waitForDone": lambda self, ms=-1: True},
+        )(),
+    )
+
+    window._on_discovery_finished(payload, window._epoch)
+    assert len(captured_caches) == 1
+    assert captured_caches[0] == window._config.size_cache
+    assert captured_caches[0] is not window._config.size_cache
+
+    # Worker mutating its local copy must not mutate window._config.size_cache.
+    captured_caches[0]["mutated-by-worker"] = {"size_bytes": 1}
+    assert "mutated-by-worker" not in window._config.size_cache
+
+    # Stale epoch COMPLETED event must not update window._config.size_cache.
+    scanned = replace(
+        prefix,
+        size_bytes=512,
+        scan_status=ScanStatus.SCANNED,
+        last_scanned=datetime.now(UTC),
+    )
+    window._on_scan_event(
+        ScanEvent(kind=ScanEventKind.COMPLETED, prefix=scanned, size_bytes=512),
+        window._epoch + 1,
+    )
+    assert key not in window._config.size_cache
+
+    # Current epoch COMPLETED event updates window._config.size_cache on the UI thread.
+    window._on_scan_event(
+        ScanEvent(kind=ScanEventKind.COMPLETED, prefix=scanned, size_bytes=512),
+        window._epoch,
+    )
+    assert key in window._config.size_cache
+    assert window._config.size_cache[key]["size_bytes"] == 512
+
+    # COMPLETED event with 0 size_bytes invalidates the cache entry.
+    zero_scanned = replace(
+        prefix,
+        size_bytes=0,
+        scan_status=ScanStatus.SCANNED,
+        last_scanned=datetime.now(UTC),
+    )
+    window._on_scan_event(
+        ScanEvent(kind=ScanEventKind.COMPLETED, prefix=zero_scanned, size_bytes=0),
+        window._epoch,
+    )
+    assert key not in window._config.size_cache
+
+
+def test_on_tool_sized_error_zeroes_size_bytes(qtbot, isolated_env: Path) -> None:
+    window = MainWindow(auto_start=False)
+    qtbot.addWidget(window)
+    tool = Tool(
+        name="BrokenBuild",
+        path=isolated_env / "BrokenBuild",
+        root=isolated_env,
+        read_only=False,
+        size_bytes=2048,
+    )
+    window._all_tools = [tool]
+    window._tools_model.set_items([tool], {}, {})
+
+    window._on_tool_sized((str(tool.path), 1024, "truncated"), window._epoch)
+
+    assert window._all_tools[0].size_bytes == 0
+    assert window._tools_model.rows()[0].size_bytes == 0
+    assert str(tool.path) in window._tools_model.failed
+    display = window._tools_model.data(
+        window._tools_model.index(0, _TOOL_SIZE_COLUMN), Qt.ItemDataRole.DisplayRole
+    )
+    assert display == "Unavailable"
+
+
+def test_delete_tools_confirmation_note_includes_failed_tool_scans(
+    qtbot, tools_deletion_setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window, target, calls, dialog_calls, summaries = tools_deletion_setup
+    window._on_tool_sized((str(target), 4096, "permission denied"), window._epoch)
+    assert str(target) in window._tools_model.failed
+    assert str(target) not in window._tools_model.pending
+
+    captured_notes: list[str] = []
+
+    def fake_confirm_selection(
+        parent: object, names: list[str], total: str, note: str, item_noun: str = "prefixes"
+    ) -> bool:
+        captured_notes.append(note)
+        return False
+
+    monkeypatch.setattr("ui.main_window.confirm_selection", fake_confirm_selection)
+
+    index = window._tools_model.index(0, _TOOL_CHECK_COLUMN)
+    assert window._tools_model.setData(
+        index, int(Qt.CheckState.Checked.value), Qt.ItemDataRole.CheckStateRole
+    )
+    window._on_delete_tools_clicked()
+
+    assert len(captured_notes) == 1
+    assert "could not be measured" in captured_notes[0]
+    assert window._tools_model.rows()[0].size_bytes == 0
+
+
+def test_orphan_review_handoff_clears_search_and_stale_selections(
+    qtbot, isolated_env: Path
+) -> None:
+    window, prefixes = _filter_fixture(qtbot, isolated_env)
+    window._set_type_filter(set(PrefixType))
+
+    # Select non-orphan prefixes (10 and 20) and set a search query that hides orphan 777.
+    window._store.select(prefixes[0])
+    window._store.select(prefixes[1])
+    window._search_box.setText("Steam One")
+    window._search_timer.timeout.emit()
+    assert [row.app_id for row in window._model.rows()] == [10]
+    assert {p.app_id for p in window._store.selected()} == {10, 20}
+
+    window._on_orphan_review_requested()
+
+    assert window._tabs.currentIndex() == _PAGE_PREFIXES
+    assert window._search_text == ""
+    assert window._search_box.text() == ""
+    assert not window._search_timer.isActive()
+    assert [row.app_id for row in window._model.rows()] == [777]
+    assert [p.app_id for p in window._store.selected()] == [777]
+
+
+def test_orphan_review_handoff_keeps_selection_while_deleting(qtbot, isolated_env: Path) -> None:
+    window, prefixes = _filter_fixture(qtbot, isolated_env)
+    window._set_type_filter(set(PrefixType))
+    window._store.select(prefixes[0])
+    window._deleting = True
+    try:
+        window._on_orphan_review_requested()
+        assert [row.app_id for row in window._model.rows()] == [777]
+        assert {p.app_id for p in window._store.selected()} == {10}
+    finally:
+        window._deleting = False

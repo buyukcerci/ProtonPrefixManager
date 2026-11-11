@@ -346,7 +346,7 @@ class PrefixTreemapWidget(TreemapWidget[Prefix]):
         return item.size_bytes
 
     def _item_label(self, item: Prefix) -> str:
-        return display_name(item)
+        return sanitize_display(display_name(item))
 
     def _item_tooltip(self, item: Prefix) -> str:
         safe_name = sanitize_display(display_name(item), limit=None)
@@ -413,7 +413,7 @@ class ToolTreemapWidget(TreemapWidget[Tool]):
         return item.size_bytes
 
     def _item_label(self, item: Tool) -> str:
-        return item.name
+        return sanitize_display(item.name)
 
     def _item_tooltip(self, item: Tool) -> str:
         safe_name = sanitize_display(item.name, limit=None)
@@ -727,7 +727,12 @@ def _tool_scan_status_text(tools: Sequence[Tool], pending: set[str], failed: set
     total = len(tools)
     if total == 0:
         return "No Proton tools found"
-    sized = total - len(pending)
+    # Count only paths of listed tools, so a stale entry in either set
+    # (a tool since deleted or filtered out) cannot skew the numbers.
+    paths = {str(tool.path) for tool in tools}
+    pending = pending & paths
+    failed = (failed & paths) - pending
+    sized = total - len(pending) - len(failed)
     text = f"{sized} of {total} tools sized"
     if pending:
         text += f", {len(pending)} scanning"
@@ -1245,7 +1250,9 @@ class OverviewPage(QScrollArea):
         self._tools_top_list.set_tools(top_tools, pending_set, failed_set, used_set, usage_known)
         self._tools_status_label.setText(_tool_scan_status_text(tools, pending_set, failed_set))
 
-        sized_tools = [tool for tool in tools if tool.size_bytes > 0]
+        sized_tools = [
+            tool for tool in tools if tool.size_bytes > 0 and str(tool.path) not in failed_set
+        ]
         # Tools zoom independently of prefixes: their own total decides
         # against the same disk capacity, so a tools treemap can show a
         # remainder while the prefix treemap zooms, and the other way around.
